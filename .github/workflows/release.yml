@@ -111,13 +111,22 @@ jobs:
           rpm -qpi target/generate-rpm/*.rpm
           rpm -qp --requires target/generate-rpm/*.rpm
 
+      - name: Collect package
+        # A single flat directory so the artifact has no subdirectories.
+        run: |
+          mkdir -p dist
+          if [ "${{ matrix.format }}" = deb ]; then
+            cp target/debian/*.deb dist/
+          else
+            cp target/generate-rpm/*.rpm dist/
+          fi
+          ls -l dist
+
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.format }}-${{ matrix.arch }}
-          path: |
-            target/debian/*.deb
-            target/generate-rpm/*.rpm
+          path: dist/*
           if-no-files-found: error
 
   smoke:
@@ -151,11 +160,12 @@ jobs:
         if: matrix.format == 'deb'
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends git python3
+          apt-get install -y --no-install-recommends \
+            git ca-certificates python3
 
       - name: Install test dependencies (Rocky)
         if: matrix.format == 'rpm'
-        run: dnf install -y git python3
+        run: dnf install -y git ca-certificates python3
 
       - uses: actions/checkout@v4
         with:
@@ -165,6 +175,9 @@ jobs:
         with:
           name: ${{ matrix.format }}-${{ matrix.arch }}
           path: dist
+
+      - name: List downloaded package
+        run: ls -l dist
 
       - name: Install package (Debian)
         if: matrix.format == 'deb'
@@ -182,7 +195,7 @@ jobs:
           test -x /usr/sbin/pwldapd
           test -f /etc/pam.d/pwldapd
           test -f /usr/share/man/man8/pwldapd.8
-          ls /lib/systemd/system/pwldapd.service /usr/lib/systemd/system/pwldapd.service 2>/dev/null
+          test -f /usr/lib/systemd/system/pwldapd.service
           /usr/sbin/pwldapd --version
 
       - name: Run the daemon and query it
