@@ -1,0 +1,4 @@
+# Configuration used by the package install smoke test in CI.
+listen = ["127.0.0.1:3389"]
+base_dn = "dc=smoke,dc=test"
+log_level = "pwldapd=debug"

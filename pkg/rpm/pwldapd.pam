@@ -1,0 +1,6 @@
+# PAM configuration for pwldapd LDAP bind authentication (Fedora/RHEL).
+# Installed as /etc/pam.d/pwldapd by the RPM package.
+# Customise it to apply LDAP-specific authentication policies independently
+# of the console login stack (e.g. add failure delays or account restrictions).
+auth     include  system-auth
+account  include  system-auth

@@ -1,35 +1,207 @@
 name: Build release
+
 on:
   push:
     tags:
       - 'v*'
+  # Manual runs build and smoke-test the packages but do not publish.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
-
-    permissions:
-      contents: write
+  package:
+    name: ${{ matrix.format }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    # Building inside a distribution container pins the glibc the
+    # package depends on to that distribution's release.
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - format: deb
+            arch: amd64
+            runner: ubuntu-24.04
+            image: debian:trixie
+          - format: deb
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            image: debian:trixie
+          - format: rpm
+            arch: x86_64
+            runner: ubuntu-24.04
+            image: rockylinux/rockylinux:10
+          - format: rpm
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+            image: rockylinux/rockylinux:10
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
+      - name: Install build dependencies (Debian)
+        if: matrix.format == 'deb'
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential libpam0g-dev curl ca-certificates git
+
+      - name: Install build dependencies (Rocky)
+        if: matrix.format == 'rpm'
+        run: dnf install -y gcc pam-devel curl ca-certificates git
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install cargo-binstall
+        run: |
+          curl -L --proto '=https' --tlsv1.2 -sSf \
+            https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh \
+            | bash
 
       - name: Install cargo-deb
-        run: cargo install cargo-deb
+        if: matrix.format == 'deb'
+        run: cargo binstall -y cargo-deb
 
-      - name: Build Debian Package
-        run: cargo deb
+      - name: Install cargo-generate-rpm
+        if: matrix.format == 'rpm'
+        run: cargo binstall -y cargo-generate-rpm
 
-      - name: Upload Artifact
+      - name: Check tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          crate="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$crate" != "$tag" ]; then
+            echo "Cargo.toml version $crate does not match tag $tag" >&2
+            exit 1
+          fi
+
+      - name: Set man page date from the release commit
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          date="$(git log -1 --format=%cd --date=format:'%B %Y')"
+          sed -i "s/^\(\.TH PWLDAPD 8 \)\"[^\"]*\"/\1\"$date\"/" pwldapd.8
+          head -1 pwldapd.8
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Build Debian package
+        if: matrix.format == 'deb'
+        run: |
+          cargo deb --no-build
+          ls -l target/debian/*.deb
+          dpkg-deb --info target/debian/*.deb
+
+      - name: Build RPM package
+        if: matrix.format == 'rpm'
+        run: |
+          cargo generate-rpm
+          ls -l target/generate-rpm/*.rpm
+          rpm -qpi target/generate-rpm/*.rpm
+          rpm -qp --requires target/generate-rpm/*.rpm
+
+      - name: Upload package
         uses: actions/upload-artifact@v4
         with:
-          name: debian-package
-          path: target/debian/*.deb
+          name: ${{ matrix.format }}-${{ matrix.arch }}
+          path: |
+            target/debian/*.deb
+            target/generate-rpm/*.rpm
+          if-no-files-found: error
+
+  smoke:
+    name: install ${{ matrix.format }} ${{ matrix.arch }}
+    needs: package
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - format: deb
+            arch: amd64
+            runner: ubuntu-24.04
+            image: debian:trixie
+          - format: deb
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            image: debian:trixie
+          - format: rpm
+            arch: x86_64
+            runner: ubuntu-24.04
+            image: rockylinux/rockylinux:10
+          - format: rpm
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+            image: rockylinux/rockylinux:10
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: pkg/ci
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.format }}-${{ matrix.arch }}
+          path: dist
+
+      - name: Install package (Debian)
+        if: matrix.format == 'deb'
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends python3 ./dist/*.deb
+
+      - name: Install package (Rocky)
+        if: matrix.format == 'rpm'
+        # Container images set tsflags=nodocs; clear it so the man page,
+        # which is marked %doc, is installed and can be checked below.
+        run: dnf --setopt=tsflags= install -y python3 ./dist/*.rpm
+
+      - name: Verify installed files
+        run: |
+          id pwldapd
+          test -x /usr/sbin/pwldapd
+          test -f /etc/pam.d/pwldapd
+          test -f /usr/share/man/man8/pwldapd.8
+          ls /lib/systemd/system/pwldapd.service /usr/lib/systemd/system/pwldapd.service 2>/dev/null
+          /usr/sbin/pwldapd --version
+
+      - name: Run the daemon and query it
+        run: |
+          /usr/sbin/pwldapd -c pkg/ci/smoke.toml &
+          pid=$!
+          sleep 2
+          python3 -I pkg/ci/smoke_client.py 127.0.0.1 3389 dc=smoke,dc=test
+          kill -TERM "$pid"
+          wait "$pid"
+
+  release:
+    needs: smoke
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List packages
+        run: ls -l dist
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/debian/*.deb
+          files: |
+            dist/*.deb
+            dist/*.rpm
+          generate_release_notes: true

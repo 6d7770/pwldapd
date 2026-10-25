@@ -4,6 +4,7 @@ version = "0.5.1"
 edition = "2024"
 rust-version = "1.88"
 description = "LDAP daemon backed by system accounts"
+license = "GPL-3.0-only"
 
 [[bin]]
 name = "pwldapd"
@@ -43,10 +44,62 @@ recommends = "libcap2-bin"
 section = "net"
 priority = "optional"
 conf-files = ["/etc/pam.d/pwldapd"]
-maintainer-scripts = "pkg/"
-systemd-units = { unit-name = "pwldapd", enable = true }
+maintainer-scripts = "pkg/deb/"
+systemd-units = { unit-name = "pwldapd", unit-scripts = "pkg/deb/", enable = true }
 assets = [
     { source = "target/release/pwldapd", dest = "usr/sbin/pwldapd", mode = "0755" },
     { source = "pwldapd.8", dest = "usr/share/man/man8/pwldapd.8", mode = "0644" },
-    { source = "pkg/pwldapd.pam", dest = "etc/pam.d/pwldapd", mode = "0644" },
+    { source = "pkg/deb/pwldapd.pam", dest = "etc/pam.d/pwldapd", mode = "0644" },
 ]
+
+[package.metadata.generate-rpm]
+summary = "LDAP daemon backed by local POSIX accounts"
+license = "GPLv3"
+url = "https://github.com/6d7770/pwldapd"
+assets = [
+    { source = "target/release/pwldapd", dest = "/usr/sbin/pwldapd", mode = "755" },
+    { source = "pwldapd.8", dest = "/usr/share/man/man8/pwldapd.8", mode = "644", doc = true },
+    { source = "pkg/rpm/pwldapd.pam", dest = "/etc/pam.d/pwldapd", mode = "644", config = "noreplace" },
+    { source = "pkg/rpm/pwldapd.service", dest = "/usr/lib/systemd/system/pwldapd.service", mode = "644" },
+]
+# cargo-generate-rpm writes the package directly, so RPM macros such as
+# %systemd_post are not available; the scriptlets are plain shell.
+pre_install_script = """
+if ! getent group pwldapd >/dev/null; then
+    groupadd -r pwldapd
+fi
+if ! getent passwd pwldapd >/dev/null; then
+    useradd -r -g pwldapd -d / -s /sbin/nologin -c "pwldapd daemon" pwldapd
+fi
+"""
+post_install_script = """
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || :
+    if [ "$1" -eq 1 ]; then
+        systemctl enable pwldapd.service >/dev/null 2>&1 || :
+    fi
+fi
+"""
+pre_uninstall_script = """
+if [ "$1" -eq 0 ] && [ -d /run/systemd/system ]; then
+    systemctl --no-reload disable pwldapd.service >/dev/null 2>&1 || :
+    systemctl stop pwldapd.service >/dev/null 2>&1 || :
+fi
+"""
+post_uninstall_script = """
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || :
+    if [ "$1" -ge 1 ]; then
+        systemctl try-restart pwldapd.service >/dev/null 2>&1 || :
+    fi
+fi
+if [ "$1" -eq 0 ]; then
+    userdel pwldapd >/dev/null 2>&1 || :
+    groupdel pwldapd >/dev/null 2>&1 || :
+fi
+"""
+
+[package.metadata.generate-rpm.requires]
+pam = "*"
+shadow-utils = "*"
+systemd = "*"

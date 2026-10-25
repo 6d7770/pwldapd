@@ -37,33 +37,53 @@ default; use `require_bind` to restrict searches to specific accounts.
 cargo build --release
 ```
 
-## Building a Debian package
+## Packages
 
-Install `cargo-deb` once, then build:
+Tagged releases on GitHub carry four packages, built natively on each
+architecture:
 
-```sh
-cargo install cargo-deb
-cargo deb
-```
+| Package | Built on | Installs on |
+|---|---|---|
+| `pwldapd_<ver>_amd64.deb`, `pwldapd_<ver>_arm64.deb` | Debian 13 (trixie) | Debian 13+, Ubuntu 25.04+ |
+| `pwldapd-<ver>.x86_64.rpm`, `pwldapd-<ver>.aarch64.rpm` | Rocky Linux 10 | RHEL, Rocky, AlmaLinux 10+, current Fedora |
 
-The resulting `.deb` is written to `target/debian/`. Install it with:
-
-```sh
-sudo dpkg -i target/debian/pwldapd_0.5.1_amd64.deb
-```
-
-The package installs:
+Each package installs:
 - `/usr/sbin/pwldapd`: the daemon binary (`CAP_NET_BIND_SERVICE` is granted
   by the systemd unit)
 - `/usr/share/man/man8/pwldapd.8`: man page
-- `/etc/pam.d/pwldapd`: default PAM configuration (treated as a conffile)
-- `/lib/systemd/system/pwldapd.service`: systemd unit
+- `/etc/pam.d/pwldapd`: default PAM configuration (a conffile; local edits
+  are preserved on upgrade)
+- `/usr/lib/systemd/system/pwldapd.service`: systemd unit
 
-The service is enabled automatically on install. To start it immediately:
+and creates the `pwldapd` system user and group. The service is enabled
+automatically on install. To start it immediately:
 
 ```sh
 sudo systemctl start pwldapd
 ```
+
+The two families differ in how the daemon reads password hashes. On Debian
+the unit adds the daemon to the `shadow` group so `pam_unix` can read
+`/etc/shadow` directly, and the PAM file includes `common-auth`. Fedora and
+RHEL have no `shadow` group, so there `pam_unix` runs its setuid
+`unix_chkpwd` helper; the RPM unit therefore omits `NoNewPrivileges` and
+keeps `CAP_DAC_READ_SEARCH`, `CAP_SETUID` and `CAP_SETGID` in the
+capability bounding set, and the PAM file includes `system-auth`. The
+packaging sources are under `pkg/deb/` and `pkg/rpm/`.
+
+### Building packages locally
+
+```sh
+cargo install cargo-deb cargo-generate-rpm
+cargo build --release
+cargo deb --no-build        # -> target/debian/*.deb
+cargo generate-rpm          # -> target/generate-rpm/*.rpm
+```
+
+Packages built on your own machine depend on the glibc installed there;
+the release workflow builds inside `debian:trixie` and
+`rockylinux/rockylinux:10` containers so that the published packages have
+a known baseline.
 
 ## Usage
 
