@@ -131,6 +131,8 @@ tls_cert     = "/etc/ssl/certs/ldap.pem"
 tls_key      = "/etc/ssl/private/ldap.key"
 log_level    = "info"
 require_bind = ["svcaccount"]
+idle_timeout    = 300
+max_connections = 256
 
 [user_attributes]
 mail       = "{uid}@example.com"
@@ -367,16 +369,24 @@ and
 .RS
 .nf
 unix_listen = [
-    { path = "/run/pwldapd/ldap.sock", owner = "root", group = "ldap", mode = 660 },
+    { path = "/run/pwldapd/ldap.sock", owner = "root", group = "ldap", mode = "660" },
 ]
 .fi
 .RE
 .PP
 .B mode
-uses chmod notation: octal digits written without a prefix, so
-.B 660
-means
-.BR 0o660 .
+is a string of octal digits such as
+.B "660"
+or
+.BR "0660" .
+A bare integer
+.RB ( 660 )
+is also accepted and read digit-for-digit as octal.
+Do not write a TOML octal literal such as
+.BR 0o660 :
+TOML converts it to the decimal 432 before
+.B pwldapd
+sees it.
 The mode is applied with an exact
 .BR chmod (2)
 call after the socket is created; the process umask does not modify it.
@@ -398,6 +408,11 @@ Plain TCP, TLS, and Unix listeners can all run simultaneously.
 If a socket file already exists at the given path when the daemon starts
 (for example, left behind by a previous run), it is removed and recreated
 automatically.
+Anything else at that path is left alone and the daemon refuses to start.
+Socket files are removed again when the daemon exits on
+.B SIGTERM
+or
+.BR SIGINT .
 .PP
 Clients connect using the
 .B ldapi://
@@ -410,7 +425,7 @@ ldapsearch \-H ldapi:///run/pwldapd/ldap.sock \-x \-b dc=example,dc=com
 .RE
 .
 .SH BIND REQUIREMENT
-By default any client\(emincluding unauthenticated anonymous clients\(emmay
+By default any client, including unauthenticated anonymous clients, may
 perform search requests.
 Setting
 .B require_bind
@@ -432,6 +447,14 @@ is set:
 .IP \(bu 4
 An anonymous bind succeeds, but subsequent searches return result code 50
 .RB ( INSUFFICIENT_ACCESS_RIGHTS ).
+.IP \(bu 4
+The bind DN must be
+.B uid=<name>,ou=people,<base_dn>
+(case-insensitive, whitespace around commas ignored) or a bare account name.
+A
+.B uid=
+component under any other parent is rejected with
+.BR INVALID_CREDENTIALS .
 .IP \(bu 4
 A bind as an account not in the list fails with
 .B INVALID_CREDENTIALS
@@ -562,23 +585,68 @@ only, while
 .B debug
 enables it for all crates.
 .
+.SH CONNECTION LIMITS
+.TP
+.B idle_timeout
+Seconds a connection may stay silent before it is closed.
+Default 300; 0 disables the timeout.
+.TP
+.B max_connections
+Maximum simultaneous client connections across all listeners (default 256).
+Connections beyond the limit are accepted and immediately closed.
+.PP
+Individual LDAP messages larger than 1 MiB are rejected.
+.
+.SH DATA SOURCE
+Users and groups are read from the system NSS databases via
+.BR getpwent (3)
+and
+.BR getgrent (3),
+so every source configured in
+.B /etc/nsswitch.conf
+is exposed, not only
+.B /etc/passwd
+and
+.BR /etc/group .
+Accounts excluded by
+.B uid_ranges
+are also removed from the
+.B memberUid
+lists of served groups.
+.
 .SH LIMITATIONS
 .B pwldapd
 is intentionally a read-only LDAP front-end.
-The following features are not supported:
 .IP \(bu 4
-Write operations (Add, Delete, Modify, ModifyDN).
+Write operations (Add, Delete, Modify, ModifyDN, Compare) receive
+.B unwillingToPerform
+(result code 53); the connection stays open.
 .IP \(bu 4
-SASL authentication.
+SASL binds receive
+.B authMethodNotSupported
+(result code 7).
+Only simple binds are supported.
 .IP \(bu 4
-StartTLS (use a dedicated LDAPS port instead).
+StartTLS and other extended operations receive
+.BR unwillingToPerform .
+Use a dedicated LDAPS port instead.
 .IP \(bu 4
-Referrals or server-side sorting.
+Filters: equality, presence, substring, >=, <=, AND, OR and NOT are
+evaluated.
+Ordering filters compare numerically when both sides are integers and
+case-insensitively otherwise.
+Approximate and extensible matches never match.
 .IP \(bu 4
-Persistent searches or change notifications.
+The client-requested
+.B sizeLimit
+is honoured
+.RB ( sizeLimitExceeded ,
+result code 4, when truncated);
+.B timeLimit
+is ignored.
 .IP \(bu 4
-Server-enforced size limits or time limits (client-requested values are
-accepted on the wire but ignored).
+Referrals, server-side sorting, persistent searches and change
+notifications are not supported.
 .
 .SH ENVIRONMENT
 .TP

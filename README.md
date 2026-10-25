@@ -49,14 +49,15 @@ cargo deb
 The resulting `.deb` is written to `target/debian/`. Install it with:
 
 ```sh
-sudo dpkg -i target/debian/pwldapd_0.1.0_amd64.deb
+sudo dpkg -i target/debian/pwldapd_0.5.1_amd64.deb
 ```
 
 The package installs:
-- `/usr/sbin/pwldapd` — the daemon binary, with `CAP_NET_BIND_SERVICE` set
-- `/usr/share/man/man8/pwldapd.8` — man page
-- `/etc/pam.d/pwldapd` — default PAM configuration (treated as a conffile)
-- `/lib/systemd/system/pwldapd.service` — systemd unit
+- `/usr/sbin/pwldapd`: the daemon binary (`CAP_NET_BIND_SERVICE` is granted
+  by the systemd unit)
+- `/usr/share/man/man8/pwldapd.8`: man page
+- `/etc/pam.d/pwldapd`: default PAM configuration (treated as a conffile)
+- `/lib/systemd/system/pwldapd.service`: systemd unit
 
 The service is enabled automatically on install. To start it immediately:
 
@@ -92,6 +93,8 @@ tls_cert     = "/etc/ssl/certs/ldap.pem"
 tls_key      = "/etc/ssl/private/ldap.key"
 log_level    = "info"
 require_bind = ["svcaccount"]
+idle_timeout    = 300
+max_connections = 256
 
 [user_attributes]
 mail       = "{uid}@example.com"
@@ -201,12 +204,14 @@ Each entry can also be an inline table with optional `owner`, `group`, and
 
 ```toml
 unix_listen = [
-    { path = "/run/pwldapd/ldap.sock", owner = "root", group = "ldap", mode = 660 },
+    { path = "/run/pwldapd/ldap.sock", owner = "root", group = "ldap", mode = "660" },
 ]
 ```
 
-`mode` uses chmod notation — octal digits written without a prefix (`660`
-means `0o660`). If `mode` is omitted the socket is created with the system
+`mode` is a string of octal digits (`"660"` or `"0660"`). A bare integer
+(`660`) is also accepted and read digit-for-digit as octal, but do not
+write a TOML octal literal such as `0o660`: TOML converts it to the
+decimal 432 before `pwldapd` sees it. If `mode` is omitted the socket is created with the system
 default permissions (the process umask applies as normal). If `owner` or
 `group` is omitted the socket's ownership is not changed. Both `owner` and
 `group` accept either a name or a numeric UID/GID.
@@ -216,14 +221,17 @@ Multiple paths are supported, and the two forms may be mixed:
 ```toml
 unix_listen = [
     "/run/pwldapd/plain.sock",
-    { path = "/run/pwldapd/restricted.sock", group = "ldap", mode = 660 },
+    { path = "/run/pwldapd/restricted.sock", group = "ldap", mode = "660" },
 ]
 ```
 
 Plain TCP, TLS, and Unix listeners can all run simultaneously.
 
 If a socket file already exists at the path when the daemon starts (e.g.
-from a previous run), it is removed and recreated automatically.
+from a previous run), it is removed and recreated automatically. Anything
+else at that path (a regular file, a directory) is left alone and the
+daemon refuses to start. Socket files are removed again on SIGTERM or
+SIGINT.
 
 Clients connect using the `ldapi://` URI scheme. With `ldapsearch`:
 
@@ -242,11 +250,17 @@ gid_ranges = ["1000-65535"]
 ```
 
 Without `gid_ranges`, all groups are served. Primary groups of served users
-are always visible regardless of the GID range.
+are always visible regardless of the GID range. Accounts excluded by
+`uid_ranges` are also removed from the `memberUid` lists of the groups
+that are served.
+
+Users and groups come from the system NSS databases via `getpwent(3)` and
+`getgrent(3)`, so any source configured in `/etc/nsswitch.conf` (not only
+`/etc/passwd` and `/etc/group`) is exposed.
 
 ### Requiring a bind before searches
 
-By default any client — including unauthenticated anonymous clients — may
+By default any client, including unauthenticated anonymous clients, may
 perform searches. Set `require_bind` to a list of account names to restrict
 this: a client must successfully bind as one of those accounts before any
 search request is permitted.
@@ -260,6 +274,8 @@ to the server before retrieving directory data. When `require_bind` is set:
 
 - An anonymous bind succeeds but subsequent searches return
   `INSUFFICIENT_ACCESS_RIGHTS` (LDAP result code 50).
+- The bind DN must be `uid=<name>,ou=people,<base_dn>` or a bare account
+  name. A `uid=` component under any other parent is rejected.
 - A bind as an account not in the list fails with `INVALID_CREDENTIALS`
   (the account is rejected by PAM), so searches remain blocked.
 - A bind as a listed account succeeds; searches are then permitted for
@@ -305,23 +321,38 @@ Or, on systems that use the include-based layout:
 ```
 
 Using a dedicated service name lets you apply LDAP-specific policies
-independently of console login — for example, adding a failure delay or
+independently of console login, for example adding a failure delay or
 restricting which accounts may bind via LDAP.
+
+### Connection limits
+
+`idle_timeout` (seconds, default 300) closes a connection that has sent
+nothing for that long; `0` disables the timeout. `max_connections`
+(default 256) caps the number of simultaneous client connections across
+all listeners; further connections are accepted and immediately closed
+until a slot frees up. Individual LDAP messages larger than 1 MiB are
+rejected.
 
 ## Limitations
 
-`pwldapd` is intentionally a read-only LDAP front-end. The following
-features are not supported:
+`pwldapd` is intentionally a read-only LDAP front-end.
 
-- **Write operations** — Add, Delete, Modify, and ModifyDN requests are
-  not handled.
-- **SASL authentication** — only simple binds (anonymous or
-  username/password) are supported.
-- **StartTLS** — use a dedicated LDAPS port (`tls_listen`) instead.
-- **Referrals and server-side sorting.**
-- **Size and time limits** — client-requested values are accepted on the
-  wire but not enforced.
-- **Persistent searches and change notifications.**
+- **Write operations**: Add, Delete, Modify, ModifyDN and Compare requests
+  receive `unwillingToPerform` (result code 53). The connection stays open.
+- **SASL authentication**: only simple binds (anonymous or
+  username/password) are supported. SASL binds receive
+  `authMethodNotSupported` (result code 7).
+- **StartTLS** and other extended operations receive `unwillingToPerform`.
+  Use a dedicated LDAPS port (`tls_listen`) instead.
+- **Filters**: equality, presence, substring, `>=`, `<=`, AND, OR and NOT
+  are evaluated. `>=` and `<=` compare numerically when both sides are
+  integers (so `(uidNumber>=1000)` works) and case-insensitively otherwise.
+  Approximate and extensible matches never match.
+- **Time limits**: the client-requested `sizeLimit` is honoured
+  (`sizeLimitExceeded`, result code 4, when truncated); `timeLimit` is
+  ignored.
+- **Referrals, server-side sorting, persistent searches and change
+  notifications** are not supported.
 
 ## Example: NSS/LDAP client configuration
 

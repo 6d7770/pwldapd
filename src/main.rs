@@ -1,4 +1,4 @@
-//! `pwldapd` — a read-only LDAP server backed by the local POSIX user and
+//! `pwldapd`: a read-only LDAP server backed by the local POSIX user and
 //! group database. Bind requests are authenticated via PAM. All other write
 //! operations are rejected. See the man page (`man pwldapd`) for full details.
 
@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
         .with_env_filter(log_filter)
         .init();
 
-    let cfg = config::merge_config(file_config)?;
+    let cfg = config::merge_config(file_config, config::derive_base_dn)?;
 
     let fmt_ranges = |ranges: &[std::ops::RangeInclusive<u32>]| -> String {
         if ranges.is_empty() {
@@ -61,10 +61,14 @@ async fn main() -> Result<()> {
         }
     };
     info!(
-        "base_dn={} uid_ranges={} gid_ranges={}",
+        "base_dn={} uid_ranges={} gid_ranges={} max_connections={} idle_timeout={}",
         cfg.base_dn,
         fmt_ranges(&cfg.uid_ranges),
         fmt_ranges(&cfg.gid_ranges),
+        cfg.max_connections,
+        cfg.idle_timeout
+            .map(|d| format!("{}s", d.as_secs()))
+            .unwrap_or_else(|| "none".into()),
     );
 
     pam_auth::check_pam_service();

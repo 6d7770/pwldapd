@@ -2,6 +2,7 @@
 name = "pwldapd"
 version = "0.5.1"
 edition = "2024"
+rust-version = "1.88"
 description = "LDAP daemon backed by system accounts"
 
 [[bin]]
@@ -9,7 +10,7 @@ name = "pwldapd"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
 libc = "0.2"

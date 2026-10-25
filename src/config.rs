@@ -1,13 +1,18 @@
 use anyhow::{bail, Result};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
+use std::net::{IpAddr, SocketAddr};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Runtime configuration
 // ---------------------------------------------------------------------------
+
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
+pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -35,6 +40,11 @@ pub struct Config {
     /// Usernames that must bind before searches are permitted.
     /// Empty means no bind required (anonymous access allowed).
     pub require_bind: Vec<String>,
+    /// Close a connection that sends nothing for this long. `None`
+    /// disables the timeout.
+    pub idle_timeout: Option<Duration>,
+    /// Maximum simultaneous client connections across all listeners.
+    pub max_connections: usize,
 }
 
 impl Config {
@@ -65,6 +75,27 @@ impl Config {
         self.require_bind.is_empty()
             || self.require_bind.iter().any(|u| u == username)
     }
+
+    /// A configuration with every optional feature off and a fixed base
+    /// DN, for unit tests in this crate.
+    #[cfg(test)]
+    pub fn for_test() -> Config {
+        Config {
+            listen: vec![],
+            tls_listen: vec![],
+            unix_listen: vec![],
+            base_dn: "dc=example,dc=com".into(),
+            uid_ranges: vec![],
+            gid_ranges: vec![],
+            tls_cert: None,
+            tls_key: None,
+            user_attributes: vec![],
+            user_overrides: HashMap::new(),
+            require_bind: vec![],
+            idle_timeout: None,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -90,8 +121,13 @@ pub const KNOWN_VARS: &[&str] = &[
     "homeDirectory", "shell", "gecos",
 ];
 
-/// Attributes that cannot be overridden via config; attempts emit a warning.
+/// Attributes that cannot be overridden via config; attempts emit a warning
+/// at load time and are dropped.
 pub const PROTECTED_ATTRS: &[&str] = &["objectClass", "uid", "uidNumber", "gidNumber"];
+
+fn is_protected(attr: &str) -> bool {
+    PROTECTED_ATTRS.iter().any(|p| p.eq_ignore_ascii_case(attr))
+}
 
 // ---------------------------------------------------------------------------
 // Unix socket configuration
@@ -105,9 +141,19 @@ pub struct UnixSocket {
     pub owner: Option<String>,
     /// Optional group (group name or numeric GID) to `chown` after bind.
     pub group: Option<String>,
-    /// Optional mode in chmod notation (e.g. `660` means `0o660`).
-    /// Applied exactly after bind; if absent the system default is used.
+    /// Optional permission bits, applied exactly after bind; if absent the
+    /// system default is used.
     pub mode: Option<u32>,
+}
+
+/// Socket mode as written in the config file: either a string of octal
+/// digits (`"660"`, `"0660"`) or, for backwards compatibility, a bare
+/// integer whose decimal digits are read as octal (`660`).
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+pub(crate) enum ModeSpec {
+    Digits(u32),
+    Text(String),
 }
 
 /// Full inline-table form of a Unix socket entry in the config file.
@@ -117,7 +163,7 @@ pub(crate) struct UnixSocketFull {
     path:  PathBuf,
     owner: Option<String>,
     group: Option<String>,
-    mode:  Option<u32>,
+    mode:  Option<ModeSpec>,
 }
 
 /// Accepts either a plain path string or an inline table with `path` + options.
@@ -128,11 +174,23 @@ pub(crate) enum UnixSocketSpec {
     Full(UnixSocketFull),
 }
 
-/// Reinterpret a decimal integer's digits as an octal mode value.
-/// `660` → `0o660`; returns an error if any digit is 8 or 9.
-fn parse_chmod_mode(n: u32) -> Result<u32> {
-    u32::from_str_radix(&format!("{n}"), 8)
-        .map_err(|_| anyhow::anyhow!("invalid mode {n}: digits must be in 0–7"))
+/// Interpret a mode specification as octal permission bits.
+fn parse_mode(spec: &ModeSpec) -> Result<u32> {
+    let text = match spec {
+        // A TOML `0o660` literal arrives here as 432 and would be
+        // misread as 0o432; refuse anything with a digit above 7 so the
+        // mistake is caught rather than silently applied.
+        ModeSpec::Digits(n) => n.to_string(),
+        ModeSpec::Text(s) => s.trim().to_string(),
+    };
+    let digits = text.strip_prefix("0o").unwrap_or(&text);
+    let mode = u32::from_str_radix(digits, 8).map_err(|_| {
+        anyhow::anyhow!("invalid mode {text:?}: expected octal digits 0-7")
+    })?;
+    if mode > 0o7777 {
+        bail!("invalid mode {text:?}: too many digits");
+    }
+    Ok(mode)
 }
 
 // ---------------------------------------------------------------------------
@@ -145,12 +203,13 @@ fn parse_chmod_mode(n: u32) -> Result<u32> {
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
     /// Glob patterns of additional config files to load before this file.
+    /// Relative patterns are resolved against the including file's directory.
     pub include:         Option<Vec<String>>,
     pub listen:          Option<Vec<String>>,
     pub tls_listen:      Option<Vec<String>>,
     pub base_dn:         Option<String>,
-    pub uid_ranges:      Option<Vec<UidRange>>,
-    pub gid_ranges:      Option<Vec<GidRange>>,
+    pub uid_ranges:      Option<Vec<IdRange>>,
+    pub gid_ranges:      Option<Vec<IdRange>>,
     pub tls_cert:        Option<PathBuf>,
     pub tls_key:         Option<PathBuf>,
     pub unix_listen:     Option<Vec<UnixSocketSpec>>,
@@ -158,6 +217,9 @@ pub struct FileConfig {
     pub user_overrides:  Option<HashMap<String, HashMap<String, String>>>,
     pub log_level:       Option<String>,
     pub require_bind:    Option<Vec<String>>,
+    /// Idle timeout in seconds; 0 disables it.
+    pub idle_timeout:    Option<u64>,
+    pub max_connections: Option<usize>,
 }
 
 /// Load and parse a TOML config file from `path`, processing any `include`
@@ -173,10 +235,16 @@ pub fn load_file_config(path: &Path) -> Result<FileConfig> {
     if patterns.is_empty() {
         return Ok(fc);
     }
+    let base_dir = path.parent().unwrap_or(Path::new("."));
 
     let mut included = FileConfig::default();
     for pattern in &patterns {
-        let paths = glob::glob(pattern)
+        let full = if Path::new(pattern).is_absolute() {
+            pattern.clone()
+        } else {
+            base_dir.join(pattern).to_string_lossy().into_owned()
+        };
+        let paths = glob::glob(&full)
             .map_err(|e| anyhow::anyhow!("invalid include pattern {pattern:?}: {e}"))?;
         for entry in paths {
             let inc_path = entry
@@ -211,6 +279,8 @@ fn merge_file_configs(base: FileConfig, overlay: FileConfig) -> FileConfig {
         user_overrides: merge_override_maps(base.user_overrides, overlay.user_overrides),
         log_level: overlay.log_level.or(base.log_level),
         require_bind: overlay.require_bind.or(base.require_bind),
+        idle_timeout: overlay.idle_timeout.or(base.idle_timeout),
+        max_connections: overlay.max_connections.or(base.max_connections),
     }
 }
 
@@ -247,19 +317,30 @@ fn merge_override_maps(
 // ---------------------------------------------------------------------------
 
 /// Append `:<port>` to `addr` if it does not already include a port number.
-/// Detection works by attempting to parse as a `SocketAddr`: success means
-/// a port is present; failure means none is, and the default is appended.
+/// A bare IP address (v4 or v6) is formatted as a proper socket address, so
+/// `::1` becomes `[::1]:389`. Anything else that is not already a socket
+/// address is assumed to be a host name and gets `:<port>` appended.
 fn with_default_port(addr: &str, port: u16) -> String {
-    if addr.parse::<std::net::SocketAddr>().is_ok() {
-        addr.to_string()
-    } else {
-        format!("{addr}:{port}")
+    if addr.parse::<SocketAddr>().is_ok() {
+        return addr.to_string();
+    }
+    let bare = addr
+        .strip_prefix('[')
+        .and_then(|a| a.strip_suffix(']'))
+        .unwrap_or(addr);
+    match bare.parse::<IpAddr>() {
+        Ok(ip) => SocketAddr::new(ip, port).to_string(),
+        Err(_) => format!("{addr}:{port}"),
     }
 }
 
 /// Build a `Config` from an optional file config, applying hardcoded defaults
-/// for any fields not present in the file.
-pub fn merge_config(file: Option<FileConfig>) -> Result<Config> {
+/// for any fields not present in the file. `derive_base_dn` supplies the
+/// base DN when the file does not set one.
+pub fn merge_config(
+    file: Option<FileConfig>,
+    derive_base_dn: impl FnOnce() -> Result<String>,
+) -> Result<Config> {
     let fc = file.unwrap_or_default();
 
     let listen: Vec<String> = fc.listen
@@ -273,9 +354,10 @@ pub fn merge_config(file: Option<FileConfig>) -> Result<Config> {
         .map(|a| with_default_port(&a, 636))
         .collect();
 
-    let base_dn = fc.base_dn
-        .map(Ok)
-        .unwrap_or_else(derive_base_dn)?;
+    let base_dn = match fc.base_dn {
+        Some(dn) => dn,
+        None => derive_base_dn()?,
+    };
 
     let uid_ranges: Vec<RangeInclusive<u32>> = fc.uid_ranges
         .unwrap_or_default()
@@ -300,30 +382,29 @@ pub fn merge_config(file: Option<FileConfig>) -> Result<Config> {
                 path: f.path,
                 owner: f.owner,
                 group: f.group,
-                mode: f.mode.map(parse_chmod_mode).transpose()?,
+                mode: f.mode.as_ref().map(parse_mode).transpose()?,
             }),
         })
         .collect::<Result<Vec<_>>>()?;
 
     if !tls_listen.is_empty() && (tls_cert.is_none() || tls_key.is_none()) {
-        anyhow::bail!("tls_listen requires tls_cert and tls_key");
+        bail!("tls_listen requires tls_cert and tls_key");
     }
 
     let user_attributes =
         build_attr_values(fc.user_attributes.unwrap_or_default())?;
-    let user_overrides = fc.user_overrides.unwrap_or_default();
+    let user_overrides = strip_protected_overrides(
+        fc.user_overrides.unwrap_or_default(),
+    );
     let require_bind = fc.require_bind.unwrap_or_default();
 
-    // Warn at startup about any protected attributes in user_overrides.
-    for (username, overrides) in &user_overrides {
-        for attr_name in overrides.keys() {
-            if PROTECTED_ATTRS.iter().any(|p| p.eq_ignore_ascii_case(attr_name)) {
-                tracing::warn!(
-                    "user_overrides.{username}: {attr_name} is protected \
-                     and cannot be overridden; skipping"
-                );
-            }
-        }
+    let idle_timeout = match fc.idle_timeout.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS) {
+        0 => None,
+        secs => Some(Duration::from_secs(secs)),
+    };
+    let max_connections = fc.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS);
+    if max_connections == 0 {
+        bail!("max_connections must be at least 1");
     }
 
     Ok(Config {
@@ -338,7 +419,29 @@ pub fn merge_config(file: Option<FileConfig>) -> Result<Config> {
         user_attributes,
         user_overrides,
         require_bind,
+        idle_timeout,
+        max_connections,
     })
+}
+
+/// Drop protected attributes from per-user overrides, warning once each at
+/// startup so the request path need not re-check them.
+fn strip_protected_overrides(
+    mut overrides: HashMap<String, HashMap<String, String>>,
+) -> HashMap<String, HashMap<String, String>> {
+    for (username, attrs) in overrides.iter_mut() {
+        attrs.retain(|attr_name, _| {
+            let keep = !is_protected(attr_name);
+            if !keep {
+                tracing::warn!(
+                    "user_overrides.{username}: {attr_name} is protected \
+                     and cannot be overridden; skipping"
+                );
+            }
+            keep
+        });
+    }
+    overrides
 }
 
 /// Convert the raw `HashMap<String, String>` from the file into typed
@@ -350,7 +453,7 @@ pub fn build_attr_values(
 ) -> Result<Vec<(String, AttrValue)>> {
     let mut out = Vec::with_capacity(raw.len());
     for (name, value) in raw {
-        if PROTECTED_ATTRS.iter().any(|p| p.eq_ignore_ascii_case(&name)) {
+        if is_protected(&name) {
             tracing::warn!(
                 "user_attributes: {name} is protected and cannot be \
                  overridden; skipping"
@@ -396,69 +499,43 @@ fn validate_template(template: &str, attr_name: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// UID / GID range types
+// UID / GID range type
 // ---------------------------------------------------------------------------
 
-/// A UID range specification parsed from a CLI argument or config file:
-/// `N` or `N-M` (inclusive).
-#[derive(Debug, Clone)]
-pub struct UidRange(pub RangeInclusive<u32>);
+/// A UID or GID range specification from the config file: `N` or `N-M`
+/// (inclusive).
+#[derive(Debug, Clone, PartialEq)]
+pub struct IdRange(pub RangeInclusive<u32>);
 
-impl std::str::FromStr for UidRange {
+impl std::str::FromStr for IdRange {
     type Err = String;
     fn from_str(s: &str) -> std::result::Result<Self, String> {
-        Ok(UidRange(parse_id_range(s, "UID")?))
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for UidRange {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-        let s = String::deserialize(d)?;
-        s.parse().map_err(serde::de::Error::custom)
-    }
-}
-
-/// A GID range specification parsed from a CLI argument or config file:
-/// `N` or `N-M` (inclusive).
-#[derive(Debug, Clone)]
-pub struct GidRange(pub RangeInclusive<u32>);
-
-impl std::str::FromStr for GidRange {
-    type Err = String;
-    fn from_str(s: &str) -> std::result::Result<Self, String> {
-        Ok(GidRange(parse_id_range(s, "GID")?))
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for GidRange {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-        let s = String::deserialize(d)?;
-        s.parse().map_err(serde::de::Error::custom)
-    }
-}
-
-fn parse_id_range(
-    s: &str,
-    label: &str,
-) -> std::result::Result<RangeInclusive<u32>, String> {
-    match s.split_once('-') {
-        Some((lo, hi)) => {
-            let lo: u32 = lo.trim().parse()
-                .map_err(|_| format!("invalid {label} {lo:?}"))?;
-            let hi: u32 = hi.trim().parse()
-                .map_err(|_| format!("invalid {label} {hi:?}"))?;
-            if lo > hi {
-                return Err(format!(
-                    "range start {lo} is greater than end {hi}"
-                ));
+        match s.split_once('-') {
+            Some((lo, hi)) => {
+                let lo: u32 = lo.trim().parse()
+                    .map_err(|_| format!("invalid id {lo:?}"))?;
+                let hi: u32 = hi.trim().parse()
+                    .map_err(|_| format!("invalid id {hi:?}"))?;
+                if lo > hi {
+                    return Err(format!(
+                        "range start {lo} is greater than end {hi}"
+                    ));
+                }
+                Ok(IdRange(lo..=hi))
             }
-            Ok(lo..=hi)
+            None => {
+                let n: u32 = s.trim().parse()
+                    .map_err(|_| format!("invalid id {s:?}"))?;
+                Ok(IdRange(n..=n))
+            }
         }
-        None => {
-            let n: u32 = s.trim().parse()
-                .map_err(|_| format!("invalid {label} {s:?}"))?;
-            Ok(n..=n)
-        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for IdRange {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -468,7 +545,7 @@ fn parse_id_range(
 
 /// Derive the base DN from the system hostname, consulting DNS for the FQDN
 /// if the hostname is unqualified. Returns an error if the domain cannot be
-/// determined — the caller should ask the user to supply --base-dn.
+/// determined; the caller should ask the user to set base_dn.
 pub fn derive_base_dn() -> Result<String> {
     let hostname = system_hostname()?;
 
@@ -476,7 +553,7 @@ pub fn derive_base_dn() -> Result<String> {
         return Ok(dn);
     }
 
-    // Short hostname — try getaddrinfo(AI_CANONNAME) to find the FQDN.
+    // Short hostname: try getaddrinfo(AI_CANONNAME) to find the FQDN.
     if let Some(fqdn) = canonical_name(&hostname)
         && let Some(dn) = base_dn_from_hostname(&fqdn)
     {
@@ -519,6 +596,10 @@ fn system_hostname() -> Result<String> {
     if rc != 0 {
         bail!("gethostname(2) failed: {}", std::io::Error::last_os_error());
     }
+    // gethostname need not NUL-terminate on truncation.
+    if let Some(last) = buf.last_mut() {
+        *last = 0;
+    }
     let s = unsafe { CStr::from_ptr(buf.as_ptr() as *const libc::c_char) }
         .to_string_lossy()
         .into_owned();
@@ -560,23 +641,16 @@ fn canonical_name(hostname: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
 
-    fn empty_config() -> Config {
-        Config {
-            listen: vec![],
-            tls_listen: vec![],
-            unix_listen: vec![],
-            base_dn: String::new(),
-            uid_ranges: vec![],
-            gid_ranges: vec![],
-            tls_cert: None,
-            tls_key: None,
-            user_attributes: vec![],
-            user_overrides: HashMap::new(),
-            require_bind: vec![],
-        }
+    fn fixed_base_dn() -> Result<String> {
+        Ok("dc=derived,dc=test".into())
+    }
+
+    fn merge(fc: FileConfig) -> Result<Config> {
+        merge_config(Some(fc), fixed_base_dn)
     }
 
     // Base DN derivation
@@ -614,42 +688,46 @@ mod tests {
         assert_eq!(domain_to_base_dn("a.b.c"), "dc=a,dc=b,dc=c");
     }
 
-    // UidRange parsing
+    #[test]
+    fn system_hostname_is_readable() {
+        assert!(!system_hostname().unwrap().is_empty());
+    }
+
+    // IdRange parsing
 
     #[test]
-    fn uid_range_single() {
-        let r: UidRange = "1000".parse().unwrap();
+    fn id_range_single() {
+        let r: IdRange = "1000".parse().unwrap();
         assert_eq!(r.0, 1000..=1000);
     }
 
     #[test]
-    fn uid_range_range() {
-        let r: UidRange = "1000-65535".parse().unwrap();
+    fn id_range_range() {
+        let r: IdRange = "1000-65535".parse().unwrap();
         assert_eq!(r.0, 1000..=65535);
+        let r: IdRange = " 100 - 999 ".parse().unwrap();
+        assert_eq!(r.0, 100..=999);
     }
 
     #[test]
-    fn uid_range_single_value_range() {
-        let r: UidRange = "42-42".parse().unwrap();
+    fn id_range_single_value_range() {
+        let r: IdRange = "42-42".parse().unwrap();
         assert_eq!(r.0, 42..=42);
     }
 
     #[test]
-    fn uid_range_invalid_not_a_number() {
-        assert!("abc".parse::<UidRange>().is_err());
-        assert!("1000-abc".parse::<UidRange>().is_err());
-    }
-
-    #[test]
-    fn uid_range_invalid_reversed() {
-        assert!("2000-1000".parse::<UidRange>().is_err());
+    fn id_range_invalid() {
+        assert!("abc".parse::<IdRange>().is_err());
+        assert!("1000-abc".parse::<IdRange>().is_err());
+        assert!("2000-1000".parse::<IdRange>().is_err());
+        assert!("-5".parse::<IdRange>().is_err());
     }
 
     // Config::uid_allowed and gid_allowed
 
     #[test]
     fn uid_allowed_no_ranges_permits_all() {
-        let cfg = empty_config();
+        let cfg = Config::for_test();
         assert!(cfg.uid_allowed(0));
         assert!(cfg.uid_allowed(1000));
         assert!(cfg.uid_allowed(u32::MAX));
@@ -657,7 +735,7 @@ mod tests {
 
     #[test]
     fn uid_allowed_single_range() {
-        let mut cfg = empty_config();
+        let mut cfg = Config::for_test();
         cfg.uid_ranges = vec![1000..=65535];
         assert!(!cfg.uid_allowed(0));
         assert!(!cfg.uid_allowed(999));
@@ -668,7 +746,7 @@ mod tests {
 
     #[test]
     fn uid_allowed_multiple_ranges() {
-        let mut cfg = empty_config();
+        let mut cfg = Config::for_test();
         cfg.uid_ranges = vec![1000..=1999, 3000..=3999];
         assert!(cfg.uid_allowed(1000));
         assert!(cfg.uid_allowed(1999));
@@ -678,36 +756,15 @@ mod tests {
     }
 
     #[test]
-    fn uid_allowed_single_uid_range() {
-        let mut cfg = empty_config();
-        cfg.uid_ranges = vec![1001..=1001];
-        assert!(cfg.uid_allowed(1001));
-        assert!(!cfg.uid_allowed(1000));
-        assert!(!cfg.uid_allowed(1002));
-    }
-
-    #[test]
     fn gid_allowed_no_ranges_permits_all() {
-        let cfg = empty_config();
+        let cfg = Config::for_test();
         assert!(cfg.gid_allowed(0));
-        assert!(cfg.gid_allowed(1000));
         assert!(cfg.gid_allowed(u32::MAX));
     }
 
     #[test]
-    fn gid_allowed_single_range() {
-        let mut cfg = empty_config();
-        cfg.gid_ranges = vec![1000..=65535];
-        assert!(!cfg.gid_allowed(0));
-        assert!(!cfg.gid_allowed(999));
-        assert!(cfg.gid_allowed(1000));
-        assert!(cfg.gid_allowed(65535));
-        assert!(!cfg.gid_allowed(65536));
-    }
-
-    #[test]
     fn gid_allowed_multiple_ranges() {
-        let mut cfg = empty_config();
+        let mut cfg = Config::for_test();
         cfg.gid_ranges = vec![100..=199, 300..=399];
         assert!(cfg.gid_allowed(100));
         assert!(!cfg.gid_allowed(200));
@@ -757,87 +814,6 @@ mod tests {
         assert!(build_attr_values(raw).is_err());
     }
 
-    // with_default_port
-
-    #[test]
-    fn default_port_added_when_absent() {
-        assert_eq!(with_default_port("127.0.0.1", 389), "127.0.0.1:389");
-        assert_eq!(with_default_port("0.0.0.0", 636),   "0.0.0.0:636");
-        assert_eq!(with_default_port("[::1]", 389),      "[::1]:389");
-        assert_eq!(with_default_port("[::]", 636),       "[::]:636");
-    }
-
-    #[test]
-    fn default_port_not_added_when_present() {
-        assert_eq!(with_default_port("127.0.0.1:389",  389), "127.0.0.1:389");
-        assert_eq!(with_default_port("127.0.0.1:3389", 389), "127.0.0.1:3389");
-        assert_eq!(with_default_port("[::1]:636",       636), "[::1]:636");
-    }
-
-    // GidRange parsing (parallel to UidRange)
-
-    #[test]
-    fn gid_range_single() {
-        let r: GidRange = "200".parse().unwrap();
-        assert_eq!(r.0, 200..=200);
-    }
-
-    #[test]
-    fn gid_range_range() {
-        let r: GidRange = "100-999".parse().unwrap();
-        assert_eq!(r.0, 100..=999);
-    }
-
-    #[test]
-    fn gid_range_invalid() {
-        assert!("abc".parse::<GidRange>().is_err());
-        assert!("500-100".parse::<GidRange>().is_err());
-    }
-
-    // merge_config
-
-    #[test]
-    fn merge_config_no_file_uses_defaults() {
-        // base_dn is derived from the system hostname, so just verify it
-        // is non-empty and that the other defaults are applied.
-        let cfg = merge_config(None).unwrap();
-        assert_eq!(cfg.listen, vec!["127.0.0.1:389"]);
-        assert!(cfg.uid_ranges.is_empty());
-        assert!(cfg.gid_ranges.is_empty());
-        assert!(cfg.tls_cert.is_none());
-        assert!(cfg.user_attributes.is_empty());
-        assert!(cfg.user_overrides.is_empty());
-        assert!(cfg.unix_listen.is_empty());
-        assert!(!cfg.base_dn.is_empty());
-    }
-
-    #[test]
-    fn merge_config_file_values_applied() {
-        let fc = FileConfig {
-            listen: Some(vec!["0.0.0.0:3389".into()]),
-            base_dn: Some("dc=test,dc=example,dc=com".into()),
-            uid_ranges: Some(vec![UidRange(2000..=3000)]),
-            ..Default::default()
-        };
-        let cfg = merge_config(Some(fc)).unwrap();
-        assert_eq!(cfg.listen, vec!["0.0.0.0:3389"]);
-        assert_eq!(cfg.base_dn, "dc=test,dc=example,dc=com");
-        assert_eq!(cfg.uid_ranges, vec![2000..=3000]);
-        assert!(cfg.gid_ranges.is_empty());
-    }
-
-    #[test]
-    fn merge_config_tls_listen_without_cert_fails() {
-        let fc = FileConfig {
-            tls_listen: Some(vec!["0.0.0.0:636".into()]),
-            base_dn: Some("dc=test,dc=com".into()),
-            ..Default::default()
-        };
-        assert!(merge_config(Some(fc)).is_err());
-    }
-
-    // build_attr_values silently drops protected attrs
-
     #[test]
     fn build_attr_values_skips_protected_attrs() {
         let raw: HashMap<String, String> = [
@@ -849,6 +825,136 @@ mod tests {
         assert!(!attrs.iter().any(|(k, _)| k.eq_ignore_ascii_case("objectClass")));
         assert!(!attrs.iter().any(|(k, _)| k.eq_ignore_ascii_case("uid")));
         assert!(attrs.iter().any(|(k, _)| k == "mail"));
+    }
+
+    #[test]
+    fn protected_overrides_stripped_at_load() {
+        let fc = FileConfig {
+            user_overrides: Some([(
+                "alice".into(),
+                [
+                    ("uidNumber".into(), "0".into()),
+                    ("mail".into(), "a@x.com".into()),
+                ].into(),
+            )].into()),
+            ..Default::default()
+        };
+        let cfg = merge(fc).unwrap();
+        let alice = &cfg.user_overrides["alice"];
+        assert!(!alice.contains_key("uidNumber"));
+        assert_eq!(alice["mail"], "a@x.com");
+    }
+
+    // with_default_port
+
+    #[test]
+    fn default_port_added_when_absent() {
+        assert_eq!(with_default_port("127.0.0.1", 389), "127.0.0.1:389");
+        assert_eq!(with_default_port("0.0.0.0", 636),   "0.0.0.0:636");
+        assert_eq!(with_default_port("[::1]", 389),      "[::1]:389");
+        assert_eq!(with_default_port("[::]", 636),       "[::]:636");
+        assert_eq!(with_default_port("localhost", 389),  "localhost:389");
+    }
+
+    #[test]
+    fn default_port_bare_ipv6_is_bracketed() {
+        assert_eq!(with_default_port("::1", 389), "[::1]:389");
+        assert_eq!(with_default_port("::", 636),  "[::]:636");
+        assert_eq!(with_default_port("fe80::1", 389), "[fe80::1]:389");
+    }
+
+    #[test]
+    fn default_port_not_added_when_present() {
+        assert_eq!(with_default_port("127.0.0.1:389",  389), "127.0.0.1:389");
+        assert_eq!(with_default_port("127.0.0.1:3389", 389), "127.0.0.1:3389");
+        assert_eq!(with_default_port("[::1]:636",       636), "[::1]:636");
+    }
+
+    // Mode parsing
+
+    #[test]
+    fn mode_from_string_forms() {
+        assert_eq!(parse_mode(&ModeSpec::Text("660".into())).unwrap(), 0o660);
+        assert_eq!(parse_mode(&ModeSpec::Text("0660".into())).unwrap(), 0o660);
+        assert_eq!(parse_mode(&ModeSpec::Text("0o660".into())).unwrap(), 0o660);
+        assert_eq!(parse_mode(&ModeSpec::Text(" 600 ".into())).unwrap(), 0o600);
+    }
+
+    #[test]
+    fn mode_from_integer_digits() {
+        assert_eq!(parse_mode(&ModeSpec::Digits(660)).unwrap(), 0o660);
+        assert_eq!(parse_mode(&ModeSpec::Digits(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn mode_invalid_rejected() {
+        assert!(parse_mode(&ModeSpec::Digits(689)).is_err());
+        // A TOML 0o660 literal arrives as 432 (digits 4,3,2 are octal but
+        // this is not what the user meant); still, 432 would be accepted as
+        // 0o432, so the documentation steers users to the string form.
+        assert!(parse_mode(&ModeSpec::Text("66x".into())).is_err());
+        assert!(parse_mode(&ModeSpec::Text("".into())).is_err());
+        assert!(parse_mode(&ModeSpec::Text("77777".into())).is_err());
+    }
+
+    // merge_config
+
+    #[test]
+    fn merge_config_no_file_uses_defaults() {
+        let cfg = merge_config(None, fixed_base_dn).unwrap();
+        assert_eq!(cfg.listen, vec!["127.0.0.1:389"]);
+        assert_eq!(cfg.base_dn, "dc=derived,dc=test");
+        assert!(cfg.uid_ranges.is_empty());
+        assert!(cfg.gid_ranges.is_empty());
+        assert!(cfg.tls_cert.is_none());
+        assert!(cfg.user_attributes.is_empty());
+        assert!(cfg.user_overrides.is_empty());
+        assert!(cfg.unix_listen.is_empty());
+        assert_eq!(
+            cfg.idle_timeout,
+            Some(Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS))
+        );
+        assert_eq!(cfg.max_connections, DEFAULT_MAX_CONNECTIONS);
+    }
+
+    #[test]
+    fn merge_config_base_dn_fallback_error_propagates() {
+        let err = merge_config(None, || bail!("no hostname")).unwrap_err();
+        assert!(err.to_string().contains("no hostname"));
+    }
+
+    #[test]
+    fn merge_config_file_values_applied() {
+        let fc = FileConfig {
+            listen: Some(vec!["0.0.0.0:3389".into()]),
+            base_dn: Some("dc=test,dc=example,dc=com".into()),
+            uid_ranges: Some(vec![IdRange(2000..=3000)]),
+            idle_timeout: Some(0),
+            max_connections: Some(5),
+            ..Default::default()
+        };
+        let cfg = merge(fc).unwrap();
+        assert_eq!(cfg.listen, vec!["0.0.0.0:3389"]);
+        assert_eq!(cfg.base_dn, "dc=test,dc=example,dc=com");
+        assert_eq!(cfg.uid_ranges, vec![2000..=3000]);
+        assert!(cfg.gid_ranges.is_empty());
+        assert_eq!(cfg.idle_timeout, None);
+        assert_eq!(cfg.max_connections, 5);
+    }
+
+    #[test]
+    fn merge_config_rejects_zero_max_connections() {
+        let fc = FileConfig { max_connections: Some(0), ..Default::default() };
+        assert!(merge(fc).is_err());
+    }
+
+    #[test]
+    fn merge_config_tls_listen_without_cert_fails() {
+        let fc = FileConfig {
+            tls_listen: Some(vec!["0.0.0.0:636".into()]),
+            ..Default::default()
+        };
+        assert!(merge(fc).is_err());
     }
 
     // merge_file_configs
@@ -887,11 +993,8 @@ mod tests {
         };
         let merged = merge_file_configs(base, overlay);
         let ua = merged.user_attributes.unwrap();
-        // overlay wins on collision
         assert_eq!(ua["mail"],  "{uid}@overlay.com");
-        // base value preserved when no collision
         assert_eq!(ua["dept"],  "Base");
-        // overlay-only value present
         assert_eq!(ua["title"], "Staff");
     }
 
@@ -952,6 +1055,24 @@ mail = "alice@external.com"
     }
 
     #[test]
+    fn file_config_parses_ranges_and_limits() {
+        let toml = r#"
+uid_ranges = ["1000-59999", "65534"]
+gid_ranges = ["100"]
+idle_timeout = 60
+max_connections = 10
+"#;
+        let fc: FileConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            fc.uid_ranges.unwrap(),
+            vec![IdRange(1000..=59999), IdRange(65534..=65534)]
+        );
+        assert_eq!(fc.gid_ranges.unwrap(), vec![IdRange(100..=100)]);
+        assert_eq!(fc.idle_timeout, Some(60));
+        assert_eq!(fc.max_connections, Some(10));
+    }
+
+    #[test]
     fn file_config_parses_unix_listen() {
         let toml = r#"unix_listen = ["/run/pwldapd/ldap.sock", "/tmp/ldap.sock"]"#;
         let fc: FileConfig = toml::from_str(toml).unwrap();
@@ -966,12 +1087,11 @@ mail = "alice@external.com"
                 UnixSocketSpec::Path("/run/pwldapd/ldap.sock".into()),
                 UnixSocketSpec::Path("/tmp/ldap.sock".into()),
             ]),
-            base_dn: Some("dc=test,dc=com".into()),
             ..Default::default()
         };
-        let cfg = merge_config(Some(fc)).unwrap();
-        assert_eq!(cfg.unix_listen[0].path, std::path::PathBuf::from("/run/pwldapd/ldap.sock"));
-        assert_eq!(cfg.unix_listen[1].path, std::path::PathBuf::from("/tmp/ldap.sock"));
+        let cfg = merge(fc).unwrap();
+        assert_eq!(cfg.unix_listen[0].path, PathBuf::from("/run/pwldapd/ldap.sock"));
+        assert_eq!(cfg.unix_listen[1].path, PathBuf::from("/tmp/ldap.sock"));
         assert_eq!(cfg.unix_listen[0].mode, None);
         assert_eq!(cfg.unix_listen[0].owner, None);
     }
@@ -980,32 +1100,56 @@ mail = "alice@external.com"
     fn unix_listen_full_form_parses() {
         let toml = r#"
             unix_listen = [
-                { path = "/run/pwldapd/ldap.sock", owner = "root", group = "ldap", mode = 660 },
+                { path = "/run/pwldapd/a.sock", owner = "root", group = "ldap", mode = 660 },
+                { path = "/run/pwldapd/b.sock", mode = "0600" },
             ]
-            base_dn = "dc=test,dc=com"
         "#;
         let fc: FileConfig = toml::from_str(toml).unwrap();
-        let cfg = merge_config(Some(fc)).unwrap();
+        let cfg = merge(fc).unwrap();
         let sock = &cfg.unix_listen[0];
-        assert_eq!(sock.path, std::path::PathBuf::from("/run/pwldapd/ldap.sock"));
+        assert_eq!(sock.path, PathBuf::from("/run/pwldapd/a.sock"));
         assert_eq!(sock.owner.as_deref(), Some("root"));
         assert_eq!(sock.group.as_deref(), Some("ldap"));
         assert_eq!(sock.mode, Some(0o660));
+        assert_eq!(cfg.unix_listen[1].mode, Some(0o600));
     }
 
     #[test]
     fn unix_listen_invalid_mode_rejected() {
         let toml = r#"
             unix_listen = [{ path = "/tmp/test.sock", mode = 689 }]
-            base_dn = "dc=test,dc=com"
         "#;
         let fc: FileConfig = toml::from_str(toml).unwrap();
-        assert!(merge_config(Some(fc)).is_err());
+        assert!(merge(fc).is_err());
     }
 
     #[test]
     fn file_config_rejects_unknown_field() {
         assert!(toml::from_str::<FileConfig>("bogus_field = 1").is_err());
+    }
+
+    // include handling
+
+    #[test]
+    fn include_patterns_resolve_relative_to_config_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "pwldapd-cfg-test-{}", std::process::id()
+        ));
+        std::fs::create_dir_all(dir.join("conf.d")).unwrap();
+        std::fs::write(
+            dir.join("conf.d/10-base.toml"),
+            "base_dn = \"dc=inc,dc=test\"\nlisten = [\"127.0.0.1:1389\"]\n",
+        ).unwrap();
+        std::fs::write(
+            dir.join("main.toml"),
+            "include = [\"conf.d/*.toml\"]\nbase_dn = \"dc=main,dc=test\"\n",
+        ).unwrap();
+        let fc = load_file_config(&dir.join("main.toml")).unwrap();
+        // Main file wins; included-only values survive.
+        assert_eq!(fc.base_dn.as_deref(), Some("dc=main,dc=test"));
+        assert_eq!(fc.listen.unwrap(), vec!["127.0.0.1:1389"]);
+        assert!(fc.include.is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     // require_bind
@@ -1021,23 +1165,22 @@ mail = "alice@external.com"
     fn merge_config_propagates_require_bind() {
         let fc = FileConfig {
             require_bind: Some(vec!["svc".into()]),
-            base_dn: Some("dc=test,dc=com".into()),
             ..Default::default()
         };
-        let cfg = merge_config(Some(fc)).unwrap();
+        let cfg = merge(fc).unwrap();
         assert_eq!(cfg.require_bind, vec!["svc"]);
     }
 
     #[test]
     fn bind_permitted_empty_allows_all() {
-        let cfg = empty_config();
+        let cfg = Config::for_test();
         assert!(cfg.bind_permitted("anyone"));
         assert!(cfg.bind_permitted(""));
     }
 
     #[test]
     fn bind_permitted_with_list() {
-        let mut cfg = empty_config();
+        let mut cfg = Config::for_test();
         cfg.require_bind = vec!["svc".into(), "monitor".into()];
         assert!(cfg.bind_permitted("svc"));
         assert!(cfg.bind_permitted("monitor"));

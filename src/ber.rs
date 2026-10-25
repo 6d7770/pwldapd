@@ -47,8 +47,16 @@ pub fn encode_length(len: usize) -> Vec<u8> {
         vec![0x81, len as u8]
     } else if len < 0x10000 {
         vec![0x82, (len >> 8) as u8, len as u8]
-    } else {
+    } else if len < 0x1000000 {
         vec![0x83, (len >> 16) as u8, (len >> 8) as u8, len as u8]
+    } else {
+        vec![
+            0x84,
+            (len >> 24) as u8,
+            (len >> 16) as u8,
+            (len >> 8) as u8,
+            len as u8,
+        ]
     }
 }
 
@@ -173,20 +181,34 @@ pub fn expect_tag(
 /// happens naturally as we shift in subsequent bytes.
 pub fn decode_integer(buf: &[u8]) -> BerResult<(i64, &[u8])> {
     let (value, rest) = expect_tag(buf, TAG_INTEGER)?;
+    Ok((decode_integer_bytes(value)?, rest))
+}
+
+/// Decode the content octets of a BER INTEGER. Shared with callers that
+/// carry an integer under a non-universal tag (e.g. AbandonRequest).
+/// Values wider than 8 octets cannot be represented and are rejected
+/// rather than silently truncated.
+pub fn decode_integer_bytes(value: &[u8]) -> BerResult<i64> {
     if value.is_empty() {
         return Err(BerError::UnexpectedEof);
+    }
+    if value.len() > 8 {
+        return Err(BerError::LengthOutOfRange);
     }
     let mut n = if value[0] & 0x80 != 0 { -1i64 } else { 0i64 };
     for b in value {
         n = (n << 8) | *b as i64;
     }
-    Ok((n, rest))
+    Ok(n)
 }
 
 pub fn decode_enumerated(buf: &[u8]) -> BerResult<(u32, &[u8])> {
     let (value, rest) = expect_tag(buf, TAG_ENUMERATED)?;
     if value.is_empty() {
         return Err(BerError::UnexpectedEof);
+    }
+    if value.len() > 4 {
+        return Err(BerError::LengthOutOfRange);
     }
     let mut n = 0u32;
     for b in value {
@@ -243,7 +265,35 @@ mod tests {
         assert_eq!(encode_integer(-128), &[0x02, 0x01, 0x80]);
     }
 
+    #[test]
+    fn integer_too_wide_rejected() {
+        let buf = [0x02, 0x09, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(matches!(
+            decode_integer(&buf),
+            Err(BerError::LengthOutOfRange)
+        ));
+        // Eight octets is the widest accepted value.
+        let buf = [0x02, 0x08, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        assert_eq!(decode_integer(&buf).unwrap().0, i64::MAX);
+    }
+
+    #[test]
+    fn integer_empty_rejected() {
+        assert!(decode_integer(&[0x02, 0x00]).is_err());
+    }
+
     // Enumerated
+
+    #[test]
+    fn enumerated_too_wide_rejected() {
+        let buf = [0x0a, 0x05, 0, 0, 0, 0, 1];
+        assert!(matches!(
+            decode_enumerated(&buf),
+            Err(BerError::LengthOutOfRange)
+        ));
+        let buf = [0x0a, 0x04, 0xff, 0xff, 0xff, 0xff];
+        assert_eq!(decode_enumerated(&buf).unwrap().0, u32::MAX);
+    }
 
     #[test]
     fn enumerated_roundtrip() {
@@ -290,8 +340,16 @@ mod tests {
     }
 
     #[test]
+    fn length_four_byte_form() {
+        assert_eq!(encode_length(0x1000000), &[0x84, 0x01, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
     fn length_roundtrip() {
-        for len in [0usize, 1, 127, 128, 255, 256, 1000, 65535] {
+        for len in [
+            0usize, 1, 127, 128, 255, 256, 1000, 65535, 0x10000, 0xffffff,
+            0x1000000, 0x7fffffff,
+        ] {
             let enc = encode_length(len);
             let (dec, consumed) = decode_length(&enc).unwrap();
             assert_eq!(dec, len);
@@ -318,6 +376,14 @@ mod tests {
         assert_eq!(tag, 0x04);
         assert!(value.is_empty());
         assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn decode_length_rejects_indefinite_and_wide_forms() {
+        // 0x80 is the indefinite form, not permitted in LDAP.
+        assert!(decode_length(&[0x80]).is_err());
+        // Five length octets exceed the supported range.
+        assert!(decode_length(&[0x85, 0, 0, 0, 0, 1]).is_err());
     }
 
     #[test]
