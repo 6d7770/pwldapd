@@ -74,7 +74,14 @@ packaging sources are under `pkg/deb/` and `pkg/rpm/`.
 ### Installing from the package repository
 
 Signed APT and dnf repositories are published to
-https://6d7770.github.io/pwldapd/ by the release workflow.
+https://6d7770.github.io/pwldapd/ by the release workflow. Packages and
+repository metadata are signed with this key:
+
+```
+pub   rsa4096 2026-10-25 [SC]
+      6AD7 2F9B 8BFD 5547 01AD  9FE2 3FF4 0033 C2B9 10AF
+uid   pwldapd package signing <michael@paddon.org>
+```
 
 Debian and Ubuntu:
 
