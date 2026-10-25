@@ -1,0 +1,5 @@
+Component: main
+Origin: pwldapd
+Label: pwldapd
+Architecture: amd64
+Description: LDAP daemon backed by local POSIX accounts

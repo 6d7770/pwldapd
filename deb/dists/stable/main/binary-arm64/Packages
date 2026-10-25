@@ -1,0 +1,19 @@
+Package: pwldapd
+Version: 0.6.0-1
+Architecture: arm64
+Maintainer: Michael Paddon <michael@paddon.org>
+Installed-Size: 4984
+Depends: adduser, libc6 (>= 2.38), libpam-runtime, libpam0g (>= 0.99.7.1)
+Recommends: libcap2-bin
+Priority: optional
+Section: net
+Filename: pool/main/p/pwldapd/pwldapd_0.6.0-1_arm64.deb
+Size: 1646840
+SHA256: 7895f9a0eaa34f19c09d53113653e65bcd39008985b7c042b7488a1e3e9e482d
+SHA1: c4a7fa4b29594b7af044d65477b378fc5738207f
+MD5sum: 2499c5556a663318abe625137989c9c5
+Description: LDAP daemon backed by system accounts
+ A read-only LDAP server (RFC 4510) that exposes the local POSIX user and group
+ database over the LDAP protocol. Bind requests are authenticated via PAM.
+ Anonymous binds are accepted. TLS (LDAPS) is supported.
+

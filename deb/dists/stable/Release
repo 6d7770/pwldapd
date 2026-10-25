@@ -1,0 +1,28 @@
+Origin: pwldapd
+Label: pwldapd
+Codename: stable
+Date: Sun, 25 Oct 2026 08:13:28 UTC
+Architectures: amd64 arm64
+Components: main
+Description: LDAP daemon backed by local POSIX accounts
+MD5Sum:
+ 8ee5c6540c21c3761216390e53b02f48 748 main/binary-amd64/Packages
+ ec2eec8388278961b2fbb197d8d1da2d 534 main/binary-amd64/Packages.gz
+ 2023dc229c70d6d58e30399858927a1a 123 main/binary-amd64/Release
+ beb6987a2133a0eed445755c0f274e4d 748 main/binary-arm64/Packages
+ 8dfc95a29235282a9d3f46a708c13776 537 main/binary-arm64/Packages.gz
+ 388e877958334695d8523302c4fb7f74 123 main/binary-arm64/Release
+SHA1:
+ 170a8743512289ce666894cf27464fa0b3f82c42 748 main/binary-amd64/Packages
+ 51e1588b15c2b0b557d080d52a5a93014887c885 534 main/binary-amd64/Packages.gz
+ 89eea51e7da5b48cf8f25885559c1cfabda0b1bd 123 main/binary-amd64/Release
+ 34b0797359911fb1c73f1d57a621706c58925296 748 main/binary-arm64/Packages
+ 10b81a677e681f87430c66a1ce4a6c794f74940f 537 main/binary-arm64/Packages.gz
+ 63b9fe307e12a6cdf534befc9f16867f19a44442 123 main/binary-arm64/Release
+SHA256:
+ 22a3dd6f153900d3c02f7fc91773c762fa30b9bca58ea9278cba6e14ea04e3ca 748 main/binary-amd64/Packages
+ 9dbff29cf925a64d5d520df31b4056011687ec33bfdbb6167aee498bdb9f901d 534 main/binary-amd64/Packages.gz
+ fb1780906d93c2568584abc3339cc0ea6683f960380c4ffdc65ee86e7b9d44e4 123 main/binary-amd64/Release
+ 5d9db79709c7447d8198e63a381c98136375ba7378071c6bd92c717da03065ae 748 main/binary-arm64/Packages
+ bd62b1d07f9cb6e8b0cf83733c46e58fa40f25c3f82eda94403baedadf9f4dbc 537 main/binary-arm64/Packages.gz
+ 790899867181cdef085ffff21d9c43605e4d8ca6701e77026dca3fcc8be5c251 123 main/binary-arm64/Release

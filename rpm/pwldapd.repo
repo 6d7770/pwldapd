@@ -1,0 +1,7 @@
+[pwldapd]
+name=pwldapd
+baseurl=https://6d7770.github.io/pwldapd/rpm/$basearch
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://6d7770.github.io/pwldapd/pwldapd-archive-keyring.asc
