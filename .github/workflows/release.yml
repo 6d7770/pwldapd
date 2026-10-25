@@ -194,7 +194,9 @@ jobs:
           id pwldapd
           test -x /usr/sbin/pwldapd
           test -f /etc/pam.d/pwldapd
-          test -f /usr/share/man/man8/pwldapd.8
+          # cargo-deb gzips the man page; cargo-generate-rpm does not.
+          test -f /usr/share/man/man8/pwldapd.8 \
+            || test -f /usr/share/man/man8/pwldapd.8.gz
           test -f /usr/lib/systemd/system/pwldapd.service
           /usr/sbin/pwldapd --version
 
