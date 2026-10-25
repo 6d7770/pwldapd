@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pwldapd packages</title>
+<style>
+  body { font-family: sans-serif; max-width: 48rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  pre { background: #f4f4f4; padding: 0.75rem; overflow-x: auto; }
+  code { font-family: monospace; }
+</style>
+</head>
+<body>
+<h1>pwldapd package repository</h1>
+<p>Signed APT and dnf repositories for
+<a href="https://github.com/6d7770/pwldapd">pwldapd</a>, a read-only LDAP
+server backed by local POSIX accounts. Packages are published for amd64 and
+arm64 by the release workflow.</p>
+
+<h2>Debian 13+ and Ubuntu 25.04+ (APT)</h2>
+<pre><code>sudo install -d /usr/share/keyrings
+curl -fsSL https://6d7770.github.io/pwldapd/pwldapd-archive-keyring.gpg \
+  | sudo tee /usr/share/keyrings/pwldapd-archive-keyring.gpg &gt;/dev/null
+echo "deb [signed-by=/usr/share/keyrings/pwldapd-archive-keyring.gpg] \
+  https://6d7770.github.io/pwldapd/deb stable main" \
+  | sudo tee /etc/apt/sources.list.d/pwldapd.list
+sudo apt update
+sudo apt install pwldapd</code></pre>
+
+<h2>RHEL, Rocky, AlmaLinux 10+ and Fedora (dnf)</h2>
+<pre><code>sudo dnf config-manager --add-repo \
+  https://6d7770.github.io/pwldapd/rpm/pwldapd.repo
+sudo dnf install pwldapd</code></pre>
+<p>On dnf 5 (Fedora 41 and later) use
+<code>sudo dnf config-manager addrepo --from-repofile=https://6d7770.github.io/pwldapd/rpm/pwldapd.repo</code>
+instead.</p>
+
+<h2>Signing key</h2>
+<p>Binary keyring: <a href="pwldapd-archive-keyring.gpg">pwldapd-archive-keyring.gpg</a>.
+ASCII-armored: <a href="pwldapd-archive-keyring.asc">pwldapd-archive-keyring.asc</a>.
+The fingerprint is listed on the
+<a href="https://github.com/6d7770/pwldapd#packages">project README</a>.</p>
+</body>
+</html>

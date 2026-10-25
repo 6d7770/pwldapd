@@ -232,3 +232,74 @@ jobs:
             dist/*.deb
             dist/*.rpm
           generate_release_notes: true
+
+  publish-repo:
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    container: debian:trixie
+    permissions:
+      contents: write
+
+    steps:
+      - name: Install tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates gnupg reprepro createrepo-c rpm
+
+      - uses: actions/checkout@v4
+
+      - name: Check for signing key
+        id: key
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: |
+          if [ -n "$APT_SIGNING_KEY" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::APT_SIGNING_KEY secret not set; skipping repository publish"
+          fi
+
+      - name: Import signing key
+        if: steps.key.outputs.present == 'true'
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: |
+          printf '%s\n' "$APT_SIGNING_KEY" | gpg --batch --import
+          gpg --list-secret-keys --keyid-format long
+
+      - uses: actions/download-artifact@v4
+        if: steps.key.outputs.present == 'true'
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Check out gh-pages
+        if: steps.key.outputs.present == 'true'
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          if git fetch origin gh-pages; then
+            git worktree add site FETCH_HEAD
+            git -C site checkout -B gh-pages
+          else
+            git worktree add --detach site
+            git -C site checkout --orphan gh-pages
+            git -C site rm -rfq . 2>/dev/null || true
+          fi
+
+      - name: Update repositories
+        if: steps.key.outputs.present == 'true'
+        run: pkg/apt/publish.sh site dist
+
+      - name: Push gh-pages
+        if: steps.key.outputs.present == 'true'
+        run: |
+          cd site
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Publish packages for ${GITHUB_REF_NAME}" \
+            || { echo "nothing to publish"; exit 0; }
+          git push origin gh-pages

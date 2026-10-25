@@ -1,0 +1,7 @@
+Origin: pwldapd
+Label: pwldapd
+Codename: stable
+Architectures: amd64 arm64
+Components: main
+Description: LDAP daemon backed by local POSIX accounts
+SignWith: yes
