@@ -222,6 +222,31 @@ pub struct FileConfig {
     pub max_connections: Option<usize>,
 }
 
+/// Default location of the configuration file.
+pub const DEFAULT_CONFIG_PATH: &str = "/etc/pwldapd.toml";
+
+/// Load the configuration file named on the command line, or the default
+/// file if it exists, or nothing.
+pub fn load_config(
+    explicit: Option<&Path>,
+    default: &Path,
+) -> Result<Option<FileConfig>> {
+    match explicit {
+        Some(path) => Ok(Some(load_file_config(path)?)),
+        None if default.exists() => Ok(Some(load_file_config(default)?)),
+        None => Ok(None),
+    }
+}
+
+/// Logging filter: the file's `log_level` wins, then `RUST_LOG`, then
+/// `pwldapd=info`.
+pub fn log_filter(file: Option<&FileConfig>) -> tracing_subscriber::EnvFilter {
+    file.and_then(|fc| fc.log_level.as_deref())
+        .map(tracing_subscriber::EnvFilter::new)
+        .or_else(|| tracing_subscriber::EnvFilter::try_from_default_env().ok())
+        .unwrap_or_else(|| "pwldapd=info".into())
+}
+
 /// Load and parse a TOML config file from `path`, processing any `include`
 /// glob patterns. Included files are merged first; the main file's values
 /// take precedence over included ones. Includes are not processed recursively.
@@ -643,6 +668,8 @@ fn canonical_name(hostname: &str) -> Option<String> {
 #[cfg(test)]
 #[allow(clippy::single_range_in_vec_init)]
 mod tests {
+    // Host assumptions: a writable std::env::temp_dir(); gethostname(2)
+    // works. DNS is not required (its result is only checked for shape).
     use super::*;
 
     fn fixed_base_dn() -> Result<String> {
@@ -1126,6 +1153,53 @@ max_connections = 10
     #[test]
     fn file_config_rejects_unknown_field() {
         assert!(toml::from_str::<FileConfig>("bogus_field = 1").is_err());
+    }
+
+    // load_config / log_filter
+
+    #[test]
+    fn load_config_precedence() {
+        let dir = std::env::temp_dir().join(format!(
+            "pwldapd-loadcfg-{}", std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let explicit = dir.join("explicit.toml");
+        let default = dir.join("default.toml");
+        std::fs::write(&explicit, "base_dn = \"dc=explicit\"\n").unwrap();
+        std::fs::write(&default, "base_dn = \"dc=default\"\n").unwrap();
+
+        let fc = load_config(Some(&explicit), &default).unwrap().unwrap();
+        assert_eq!(fc.base_dn.as_deref(), Some("dc=explicit"));
+        let fc = load_config(None, &default).unwrap().unwrap();
+        assert_eq!(fc.base_dn.as_deref(), Some("dc=default"));
+        assert!(load_config(None, &dir.join("missing.toml")).unwrap().is_none());
+        // An explicit path that does not exist is an error, not a fallback.
+        assert!(load_config(Some(&dir.join("missing.toml")), &default).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn log_filter_sources() {
+        let fc = FileConfig { log_level: Some("pwldapd=trace".into()), ..Default::default() };
+        assert_eq!(log_filter(Some(&fc)).to_string(), "pwldapd=trace");
+        // Without a file setting the default applies (RUST_LOG is not set
+        // in the test environment; if it is, the value is still a filter).
+        let f = log_filter(None).to_string();
+        assert!(f == "pwldapd=info" || std::env::var("RUST_LOG").is_ok());
+        assert_eq!(log_filter(Some(&FileConfig::default())).to_string(), f);
+    }
+
+    #[test]
+    fn derive_base_dn_runs_without_panicking() {
+        // Host dependent result; only the contract (Ok non-empty or Err
+        // mentioning base_dn) is checked.
+        match derive_base_dn() {
+            Ok(dn) => assert!(dn.starts_with("dc=")),
+            Err(e) => assert!(e.to_string().contains("base_dn")),
+        }
+        // canonical_name on loopback either resolves or returns None.
+        let _ = canonical_name("localhost");
+        assert!(canonical_name("no-such-host.invalid").is_none());
     }
 
     // include handling

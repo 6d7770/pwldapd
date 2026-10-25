@@ -542,10 +542,147 @@ fn matches_substrings(
     }
 }
 
+/// BER builders and decoders shared by the test modules of this crate.
 #[cfg(test)]
-mod tests {
+pub mod testutil {
     use super::*;
     use crate::ber;
+
+    /// Wrap a BER-encoded protocol op in an LDAPMessage with `id`.
+    pub fn envelope(id: i64, op: Vec<u8>) -> Vec<u8> {
+        let mut content = ber::encode_integer(id);
+        content.extend(op);
+        ber::encode_tlv(ber::TAG_SEQUENCE, &content)
+    }
+
+    /// Simple bind: version 3, `name`, `password` under the [0] choice.
+    pub fn bind_msg(id: i64, name: &str, password: &str) -> Vec<u8> {
+        let mut body = ber::encode_integer(3);
+        body.extend(ber::encode_string(name));
+        body.extend(ber::encode_tlv(CTX_SIMPLE_AUTH, password.as_bytes()));
+        envelope(id, ber::encode_tlv(APP_BIND_REQUEST, &body))
+    }
+
+    /// SASL bind with the given mechanism and no credentials.
+    pub fn sasl_bind_msg(id: i64, mechanism: &str) -> Vec<u8> {
+        let mut body = ber::encode_integer(3);
+        body.extend(ber::encode_string(""));
+        body.extend(ber::encode_tlv(0xa3, &ber::encode_string(mechanism)));
+        envelope(id, ber::encode_tlv(APP_BIND_REQUEST, &body))
+    }
+
+    pub fn unbind_msg(id: i64) -> Vec<u8> {
+        envelope(id, ber::encode_tlv(APP_UNBIND_REQUEST, &[]))
+    }
+
+    /// Search request with the given raw filter bytes and no attribute list
+    /// restriction.
+    pub fn search_msg(
+        id: i64,
+        base: &str,
+        scope: u32,
+        size_limit: i64,
+        types_only: bool,
+        filter: Vec<u8>,
+    ) -> Vec<u8> {
+        search_msg_attrs(id, base, scope, size_limit, types_only, filter, &[])
+    }
+
+    pub fn search_msg_attrs(
+        id: i64,
+        base: &str,
+        scope: u32,
+        size_limit: i64,
+        types_only: bool,
+        filter: Vec<u8>,
+        attrs: &[&str],
+    ) -> Vec<u8> {
+        let mut body = ber::encode_string(base);
+        body.extend(ber::encode_enumerated(scope));
+        body.extend(ber::encode_enumerated(0));
+        body.extend(ber::encode_integer(size_limit));
+        body.extend(ber::encode_integer(0));
+        body.extend(ber::encode_tlv(
+            ber::TAG_BOOLEAN,
+            &[if types_only { 0xff } else { 0 }],
+        ));
+        body.extend(filter);
+        let attr_list: Vec<u8> =
+            attrs.iter().flat_map(|a| ber::encode_string(a)).collect();
+        body.extend(ber::encode_tlv(ber::TAG_SEQUENCE, &attr_list));
+        envelope(id, ber::encode_tlv(APP_SEARCH_REQUEST, &body))
+    }
+
+    /// Filter builders (raw BER).
+    pub fn f_present(attr: &str) -> Vec<u8> {
+        ber::encode_tlv(0x87, attr.as_bytes())
+    }
+    fn ava(tag: u8, attr: &str, value: &str) -> Vec<u8> {
+        let mut c = ber::encode_string(attr);
+        c.extend(ber::encode_string(value));
+        ber::encode_tlv(tag, &c)
+    }
+    pub fn f_eq(attr: &str, value: &str) -> Vec<u8> { ava(0xa3, attr, value) }
+    pub fn f_ge(attr: &str, value: &str) -> Vec<u8> { ava(0xa5, attr, value) }
+    pub fn f_le(attr: &str, value: &str) -> Vec<u8> { ava(0xa6, attr, value) }
+    pub fn f_and(parts: &[Vec<u8>]) -> Vec<u8> {
+        ber::encode_tlv(0xa0, &parts.concat())
+    }
+    pub fn f_or(parts: &[Vec<u8>]) -> Vec<u8> {
+        ber::encode_tlv(0xa1, &parts.concat())
+    }
+    pub fn f_not(inner: Vec<u8>) -> Vec<u8> {
+        ber::encode_tlv(0xa2, &inner)
+    }
+    /// Substring filter from optional initial, any list and optional final.
+    pub fn f_substrings(
+        attr: &str,
+        initial: Option<&str>,
+        any: &[&str],
+        final_: Option<&str>,
+    ) -> Vec<u8> {
+        let mut subs = Vec::new();
+        if let Some(i) = initial {
+            subs.extend(ber::encode_tlv(0x80, i.as_bytes()));
+        }
+        for a in any {
+            subs.extend(ber::encode_tlv(0x81, a.as_bytes()));
+        }
+        if let Some(f) = final_ {
+            subs.extend(ber::encode_tlv(0x82, f.as_bytes()));
+        }
+        let mut c = ber::encode_string(attr);
+        c.extend(ber::encode_tlv(ber::TAG_SEQUENCE, &subs));
+        ber::encode_tlv(0xa4, &c)
+    }
+
+    /// Decode `(message_id, op_tag, op_value)` from one encoded message.
+    pub fn decode_envelope(bytes: &[u8]) -> (i64, u8, Vec<u8>) {
+        let (seq, rest) = ber::expect_tag(bytes, ber::TAG_SEQUENCE).unwrap();
+        assert!(rest.is_empty(), "trailing bytes after message");
+        let (id, rest) = ber::decode_integer(seq).unwrap();
+        let (tag, value, _) = ber::parse_tlv(rest).unwrap();
+        (id, tag, value.to_vec())
+    }
+
+    /// Result code from an LDAPResult-shaped op value.
+    pub fn result_code(op_value: &[u8]) -> u32 {
+        ber::decode_enumerated(op_value).unwrap().0
+    }
+
+    /// Response application tags.
+    pub const BIND_RESPONSE: u8 = APP_BIND_RESPONSE;
+    pub const SEARCH_RESULT_ENTRY: u8 = APP_SEARCH_RESULT_ENTRY;
+    pub const SEARCH_RESULT_DONE: u8 = APP_SEARCH_RESULT_DONE;
+    pub const EXTENDED_RESPONSE: u8 = APP_EXTENDED_RESPONSE;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testutil::*;
+    use super::*;
+    use crate::ber;
+    use proptest::prelude::*;
 
     // Helpers
 
@@ -568,13 +705,6 @@ mod tests {
 
     fn le(attr: &str, value: &str) -> Filter {
         Filter::LessOrEqual { attr: attr.into(), value: value.into() }
-    }
-
-    /// Wrap a BER-encoded protocol op in an LDAPMessage with `id`.
-    fn message(id: i64, op: Vec<u8>) -> Vec<u8> {
-        let mut content = ber::encode_integer(id);
-        content.extend(op);
-        ber::encode_tlv(ber::TAG_SEQUENCE, &content)
     }
 
     // DN normalisation
@@ -916,7 +1046,7 @@ mod tests {
         let mut body = ber::encode_integer(3);
         body.extend(ber::encode_string(""));
         body.extend(sasl);
-        let msg = message(9, ber::encode_tlv(APP_BIND_REQUEST, &body));
+        let msg = envelope(9, ber::encode_tlv(APP_BIND_REQUEST, &body));
         let msg = parse_message(&msg).unwrap();
         let LdapOperation::BindRequest(req) = msg.operation
             else { panic!("wrong op") };
@@ -935,7 +1065,7 @@ mod tests {
             (APP_COMPARE_REQUEST, 0x6f),
             (APP_EXTENDED_REQUEST, APP_EXTENDED_RESPONSE),
         ] {
-            let msg = message(5, ber::encode_tlv(tag, b"xx"));
+            let msg = envelope(5, ber::encode_tlv(tag, b"xx"));
             let msg = parse_message(&msg).unwrap();
             let LdapOperation::Unsupported { tag: t, response_tag } =
                 msg.operation
@@ -947,17 +1077,17 @@ mod tests {
 
     #[test]
     fn parse_unknown_operation_is_error() {
-        let msg = message(5, ber::encode_tlv(0x7e, b""));
+        let msg = envelope(5, ber::encode_tlv(0x7e, b""));
         assert!(parse_message(&msg).is_err());
     }
 
     #[test]
     fn parse_abandon_request() {
-        let msg = message(6, ber::encode_tlv(APP_ABANDON_REQUEST, &[0x05]));
+        let msg = envelope(6, ber::encode_tlv(APP_ABANDON_REQUEST, &[0x05]));
         let msg = parse_message(&msg).unwrap();
         assert!(matches!(msg.operation, LdapOperation::AbandonRequest(5)));
         // Over-wide id is rejected rather than truncated.
-        let msg = message(6, ber::encode_tlv(APP_ABANDON_REQUEST, &[1; 9]));
+        let msg = envelope(6, ber::encode_tlv(APP_ABANDON_REQUEST, &[1; 9]));
         assert!(parse_message(&msg).is_err());
     }
 
@@ -1009,17 +1139,17 @@ mod tests {
         assert_eq!(value, "alice");
     }
 
-    /// Build a SearchRequest message with the given raw filter bytes.
+    /// Search over "dc=local", subtree, with the given raw filter bytes.
     fn search_message(size_limit: i64, types_only: bool, filter: Vec<u8>) -> Vec<u8> {
-        let mut body = ber::encode_string("dc=local");
-        body.extend(ber::encode_enumerated(2));
-        body.extend(ber::encode_enumerated(0));
-        body.extend(ber::encode_integer(size_limit));
-        body.extend(ber::encode_integer(0));
-        body.extend(ber::encode_tlv(ber::TAG_BOOLEAN, &[if types_only { 0xff } else { 0 }]));
-        body.extend(filter);
-        body.extend(ber::encode_tlv(ber::TAG_SEQUENCE, &[]));
-        message(8, ber::encode_tlv(APP_SEARCH_REQUEST, &body))
+        search_msg(8, "dc=local", 2, size_limit, types_only, filter)
+    }
+
+    fn parse_filter_of(filter: Vec<u8>) -> BerResult<Filter> {
+        let msg = parse_message(&search_message(0, false, filter))?;
+        match msg.operation {
+            LdapOperation::SearchRequest(req) => Ok(req.filter),
+            _ => panic!("wrong op"),
+        }
     }
 
     #[test]
@@ -1076,6 +1206,254 @@ mod tests {
             parse_message(&search_message(0, false, f)),
             Err(BerError::NestingTooDeep)
         ));
+    }
+
+
+    // Substring filter parsing (wire level)
+
+    #[test]
+    fn parse_substrings_each_component() {
+        let f = parse_filter_of(f_substrings("cn", Some("Al"), &[], None)).unwrap();
+        let Filter::Substrings { attr, initial, any, final_ } = f else { panic!() };
+        assert_eq!((attr.as_str(), initial.as_deref(), any.len(), final_), ("cn", Some("Al"), 0, None));
+
+        let f = parse_filter_of(f_substrings("cn", None, &["li", "ce"], None)).unwrap();
+        let Filter::Substrings { initial, any, final_, .. } = f else { panic!() };
+        assert_eq!((initial, any, final_), (None, vec!["li".to_string(), "ce".to_string()], None));
+
+        let f = parse_filter_of(f_substrings("cn", None, &[], Some("th"))).unwrap();
+        let Filter::Substrings { initial, any, final_, .. } = f else { panic!() };
+        assert_eq!((initial, any.len(), final_.as_deref()), (None, 0, Some("th")));
+
+        let f = parse_filter_of(f_substrings("cn", Some("A"), &["i"], Some("h"))).unwrap();
+        let Filter::Substrings { initial, any, final_, .. } = f else { panic!() };
+        assert_eq!(
+            (initial.as_deref(), any, final_.as_deref()),
+            (Some("A"), vec!["i".to_string()], Some("h"))
+        );
+    }
+
+    #[test]
+    fn parse_substrings_unknown_subtag_ignored_and_bad_utf8_rejected() {
+        // [3] is not a defined substring choice; it is skipped.
+        let mut subs = ber::encode_tlv(0x80, b"A");
+        subs.extend(ber::encode_tlv(0x83, b"junk"));
+        let mut c = ber::encode_string("cn");
+        c.extend(ber::encode_tlv(ber::TAG_SEQUENCE, &subs));
+        let f = parse_filter_of(ber::encode_tlv(0xa4, &c)).unwrap();
+        let Filter::Substrings { initial, any, .. } = f else { panic!() };
+        assert_eq!((initial.as_deref(), any.len()), (Some("A"), 0));
+
+        let subs = ber::encode_tlv(0x80, &[0xff, 0xfe]);
+        let mut c = ber::encode_string("cn");
+        c.extend(ber::encode_tlv(ber::TAG_SEQUENCE, &subs));
+        assert!(matches!(
+            parse_filter_of(ber::encode_tlv(0xa4, &c)),
+            Err(BerError::InvalidUtf8)
+        ));
+    }
+
+    #[test]
+    fn parse_substrings_roundtrip_matches() {
+        // (cn=Al*ce Sm*) parsed from the wire matches "Alice Smith".
+        let f = parse_filter_of(f_substrings("cn", Some("Al"), &["ce Sm"], None)).unwrap();
+        assert!(matches_filter(&f, &attrs(&[("cn", &["Alice Smith"])])));
+        assert!(!matches_filter(&f, &attrs(&[("cn", &["Bob Smith"])])));
+    }
+
+    // Parse error arms
+
+    #[test]
+    fn parse_search_invalid_scope() {
+        let msg = search_msg(1, "dc=local", 3, 0, false, f_present("objectClass"));
+        assert!(matches!(parse_message(&msg), Err(BerError::InvalidValue)));
+    }
+
+    #[test]
+    fn parse_search_attribute_list_must_hold_strings() {
+        let mut body = ber::encode_string("dc=local");
+        body.extend(ber::encode_enumerated(0));
+        body.extend(ber::encode_enumerated(0));
+        body.extend(ber::encode_integer(0));
+        body.extend(ber::encode_integer(0));
+        body.extend(ber::encode_tlv(ber::TAG_BOOLEAN, &[0]));
+        body.extend(f_present("objectClass"));
+        body.extend(ber::encode_tlv(ber::TAG_SEQUENCE, &ber::encode_integer(1)));
+        let msg = envelope(1, ber::encode_tlv(APP_SEARCH_REQUEST, &body));
+        assert!(matches!(
+            parse_message(&msg),
+            Err(BerError::UnexpectedTag { expected: 0x04, got: 0x02 })
+        ));
+    }
+
+    #[test]
+    fn parse_search_attribute_list_decoded() {
+        let msg = search_msg_attrs(1, "dc=local", 0, 0, false, f_present("x"), &["uid", "cn"]);
+        let LdapOperation::SearchRequest(req) = parse_message(&msg).unwrap().operation
+            else { panic!() };
+        assert_eq!(req.attributes, vec!["uid", "cn"]);
+    }
+
+    #[test]
+    fn parse_bind_truncated_and_bad_utf8() {
+        // No auth choice after the name.
+        let mut body = ber::encode_integer(3);
+        body.extend(ber::encode_string("alice"));
+        let msg = envelope(1, ber::encode_tlv(APP_BIND_REQUEST, &body));
+        assert!(matches!(parse_message(&msg), Err(BerError::UnexpectedEof)));
+        // Password that is not UTF-8.
+        let mut body = ber::encode_integer(3);
+        body.extend(ber::encode_string("alice"));
+        body.extend(ber::encode_tlv(CTX_SIMPLE_AUTH, &[0xc0]));
+        let msg = envelope(1, ber::encode_tlv(APP_BIND_REQUEST, &body));
+        assert!(matches!(parse_message(&msg), Err(BerError::InvalidUtf8)));
+    }
+
+    #[test]
+    fn parse_filter_error_arms() {
+        assert!(matches!(
+            parse_filter_of(ber::encode_tlv(0x87, &[0xff])),
+            Err(BerError::InvalidUtf8)
+        ));
+        // Equality with a missing value.
+        assert!(parse_filter_of(ber::encode_tlv(0xa3, &ber::encode_string("uid"))).is_err());
+        // NOT with empty content.
+        assert!(matches!(
+            parse_filter_of(ber::encode_tlv(0xa2, &[])),
+            Err(BerError::UnexpectedEof)
+        ));
+        // Composite filters parse all children.
+        let f = parse_filter_of(f_or(&[f_eq("uid", "a"), f_not(f_le("uidNumber", "5"))])).unwrap();
+        let Filter::Or(children) = f else { panic!() };
+        assert!(matches!(children[1], Filter::Not(_)));
+        assert!(matches!(children[0], Filter::EqualityMatch { .. }));
+    }
+
+    #[test]
+    fn parse_message_rejects_non_sequence_and_missing_op() {
+        assert!(parse_message(&ber::encode_string("x")).is_err());
+        let only_id = ber::encode_tlv(ber::TAG_SEQUENCE, &ber::encode_integer(1));
+        assert!(matches!(parse_message(&only_id), Err(BerError::UnexpectedEof)));
+    }
+
+    #[test]
+    fn parse_filter_depth_boundary_accepted() {
+        // Exactly MAX_FILTER_DEPTH nested NOTs around a leaf is accepted;
+        // the existing test checks that one more is rejected.
+        let mut f = f_present("uid");
+        for _ in 0..MAX_FILTER_DEPTH {
+            f = f_not(f);
+        }
+        assert!(parse_filter_of(f).is_ok());
+    }
+
+    // Property tests
+
+    fn arb_filter() -> impl Strategy<Value = Filter> {
+        let leaf = prop_oneof![
+            (".{0,8}", ".{0,8}").prop_map(|(attr, value)| Filter::EqualityMatch { attr, value }),
+            (".{0,8}", ".{0,8}").prop_map(|(attr, value)| Filter::GreaterOrEqual { attr, value }),
+            (".{0,8}", ".{0,8}").prop_map(|(attr, value)| Filter::LessOrEqual { attr, value }),
+            ".{0,8}".prop_map(Filter::Present),
+            (".{0,8}", proptest::option::of(".{0,4}"),
+             proptest::collection::vec(".{0,4}", 0..3), proptest::option::of(".{0,4}"))
+                .prop_map(|(attr, initial, any, final_)| Filter::Substrings { attr, initial, any, final_ }),
+            Just(Filter::ApproxMatch),
+            Just(Filter::Unsupported),
+        ];
+        leaf.prop_recursive(4, 16, 3, |inner| {
+            prop_oneof![
+                proptest::collection::vec(inner.clone(), 0..3).prop_map(Filter::And),
+                proptest::collection::vec(inner.clone(), 0..3).prop_map(Filter::Or),
+                inner.prop_map(|f| Filter::Not(Box::new(f))),
+            ]
+        })
+    }
+
+    fn arb_attrs() -> impl Strategy<Value = Attrs> {
+        proptest::collection::vec(
+            (".{0,8}", proptest::collection::vec(".{0,8}", 0..3)),
+            0..4,
+        )
+    }
+
+    proptest! {
+        #[test]
+        fn parse_message_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..64)) {
+            let _ = parse_message(&bytes);
+        }
+
+        #[test]
+        fn parse_tlv_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..64)) {
+            let _ = ber::parse_tlv(&bytes);
+            let _ = ber::decode_integer(&bytes);
+            let _ = ber::decode_enumerated(&bytes);
+            let _ = ber::decode_string(&bytes);
+            let _ = ber::decode_boolean(&bytes);
+        }
+
+        #[test]
+        fn mutated_search_never_panics(
+            idx in 0usize..80, byte in any::<u8>(), cut in 0usize..80,
+        ) {
+            // Flip one byte of a valid search and truncate; parsing must
+            // return, never panic.
+            let mut msg = search_msg(1, "ou=people,dc=local", 2, 0, false,
+                f_and(&[f_eq("objectClass", "posixAccount"), f_substrings("cn", Some("A"), &["l"], None)]));
+            if idx < msg.len() { msg[idx] = byte; }
+            msg.truncate(cut.min(msg.len()));
+            let _ = parse_message(&msg);
+        }
+
+        #[test]
+        fn integer_roundtrip_all_i64(n in any::<i64>()) {
+            let enc = ber::encode_integer(n);
+            let (dec, rest) = ber::decode_integer(&enc).unwrap();
+            prop_assert_eq!(dec, n);
+            prop_assert!(rest.is_empty());
+        }
+
+        #[test]
+        fn length_roundtrip_u32(n in any::<u32>()) {
+            let enc = ber::encode_length(n as usize);
+            let (dec, used) = ber::decode_length(&enc).unwrap();
+            prop_assert_eq!(dec, n as usize);
+            prop_assert_eq!(used, enc.len());
+        }
+
+        #[test]
+        fn enumerated_roundtrip(n in any::<u32>()) {
+            let enc = ber::encode_enumerated(n);
+            let (dec, _) = ber::decode_enumerated(&enc).unwrap();
+            prop_assert_eq!(dec, n);
+        }
+
+        #[test]
+        fn response_roundtrip(id in any::<i64>(), code in any::<u32>(), diag in ".{0,16}") {
+            let bytes = encode_response(id, &Response::Bind(LdapResult::error(code, diag)));
+            let (got_id, tag, value) = decode_envelope(&bytes);
+            prop_assert_eq!(got_id, id);
+            prop_assert_eq!(tag, APP_BIND_RESPONSE);
+            prop_assert_eq!(result_code(&value), code);
+        }
+
+        #[test]
+        fn normalize_dn_idempotent(dn in ".{0,40}") {
+            let once = normalize_dn(&dn);
+            prop_assert_eq!(normalize_dn(&once), once.clone());
+            // Splitting never loses or reorders characters.
+            prop_assert_eq!(split_rdns(&dn).join(","), dn);
+        }
+
+        #[test]
+        fn matches_filter_never_panics(f in arb_filter(), a in arb_attrs()) {
+            let _ = matches_filter(&f, &a);
+        }
+
+        #[test]
+        fn leaf_value_never_panics(dn in ".{0,40}", attr in "[a-z]{1,4}", parent in ".{0,20}") {
+            let _ = leaf_value(&dn, &attr, &normalize_dn(&parent));
+        }
     }
 
     // Search with AND filter: (&(objectClass=posixAccount)(uid=alice))
@@ -1135,15 +1513,6 @@ mod tests {
     }
 
     // Message encoding
-
-    /// Decode `(message_id, op_tag, op_value)` from an encoded message.
-    fn decode_envelope(bytes: &[u8]) -> (i64, u8, Vec<u8>) {
-        let (seq, rest) = ber::expect_tag(bytes, ber::TAG_SEQUENCE).unwrap();
-        assert!(rest.is_empty());
-        let (id, rest) = ber::decode_integer(seq).unwrap();
-        let (tag, value, _) = ber::parse_tlv(rest).unwrap();
-        (id, tag, value.to_vec())
-    }
 
     #[test]
     fn encode_bind_response_success() {

@@ -333,6 +333,29 @@ all listeners; further connections are accepted and immediately closed
 until a slot frees up. Individual LDAP messages larger than 1 MiB are
 rejected.
 
+## Development
+
+Run the unit tests and lints with:
+
+```
+cargo test
+cargo clippy --all-targets -- -D warnings
+```
+
+Test coverage is measured with [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov):
+
+```
+cargo install cargo-llvm-cov
+rustup component add llvm-tools
+cargo llvm-cov --summary-only     # per-file table
+cargo llvm-cov --html             # report in target/llvm-cov/html
+```
+
+CI fails if line coverage drops below 90%. The tests need no network
+access, root privileges or LDAP client tools; the protocol tests drive the
+handler over in-memory pipes and loopback sockets, and TLS tests generate
+a throwaway certificate at run time.
+
 ## Limitations
 
 `pwldapd` is intentionally a read-only LDAP front-end.

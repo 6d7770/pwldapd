@@ -68,36 +68,34 @@ pub fn encode_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
 }
 
 pub fn encode_integer(n: i64) -> Vec<u8> {
-    let bytes: Vec<u8> = if n == 0 {
-        vec![0]
-    } else {
-        let raw = n.to_be_bytes();
-        let mut start = 0;
-        while start < 7 {
-            // Strip leading 0x00 when next byte's high bit is clear
-            if raw[start] == 0x00 && raw[start + 1] & 0x80 == 0 {
-                start += 1;
-            // Strip leading 0xff when next byte's high bit is set
-            } else if raw[start] == 0xff && raw[start + 1] & 0x80 != 0 {
-                start += 1;
-            } else {
-                break;
-            }
-        }
-        raw[start..].to_vec()
-    };
-    encode_tlv(TAG_INTEGER, &bytes)
+    encode_tlv(TAG_INTEGER, &integer_content(n))
 }
 
+/// Minimal two's-complement big-endian content octets for `n`.
+fn integer_content(n: i64) -> Vec<u8> {
+    if n == 0 {
+        return vec![0];
+    }
+    let raw = n.to_be_bytes();
+    let mut start = 0;
+    while start < 7 {
+        // Strip leading 0x00 when next byte's high bit is clear
+        if raw[start] == 0x00 && raw[start + 1] & 0x80 == 0 {
+            start += 1;
+        // Strip leading 0xff when next byte's high bit is set
+        } else if raw[start] == 0xff && raw[start + 1] & 0x80 != 0 {
+            start += 1;
+        } else {
+            break;
+        }
+    }
+    raw[start..].to_vec()
+}
+
+/// ENUMERATED shares INTEGER's content encoding; LDAP result codes are
+/// non-negative, so the value is encoded as an unsigned quantity.
 pub fn encode_enumerated(n: u32) -> Vec<u8> {
-    let bytes = if n < 0x80 {
-        vec![n as u8]
-    } else if n < 0x8000 {
-        vec![(n >> 8) as u8, n as u8]
-    } else {
-        vec![(n >> 16) as u8, (n >> 8) as u8, n as u8]
-    };
-    encode_tlv(TAG_ENUMERATED, &bytes)
+    encode_tlv(TAG_ENUMERATED, &integer_content(n as i64))
 }
 
 pub fn encode_octet_string(s: &[u8]) -> Vec<u8> {
@@ -202,18 +200,12 @@ pub fn decode_integer_bytes(value: &[u8]) -> BerResult<i64> {
     Ok(n)
 }
 
+/// Decode a BER ENUMERATED into a `u32`. Negative values and values above
+/// `u32::MAX` have no meaning for LDAP enumerations and are rejected.
 pub fn decode_enumerated(buf: &[u8]) -> BerResult<(u32, &[u8])> {
     let (value, rest) = expect_tag(buf, TAG_ENUMERATED)?;
-    if value.is_empty() {
-        return Err(BerError::UnexpectedEof);
-    }
-    if value.len() > 4 {
-        return Err(BerError::LengthOutOfRange);
-    }
-    let mut n = 0u32;
-    for b in value {
-        n = (n << 8) | *b as u32;
-    }
+    let n = decode_integer_bytes(value)?;
+    let n = u32::try_from(n).map_err(|_| BerError::InvalidValue)?;
     Ok((n, rest))
 }
 
@@ -285,19 +277,26 @@ mod tests {
     // Enumerated
 
     #[test]
-    fn enumerated_too_wide_rejected() {
-        let buf = [0x0a, 0x05, 0, 0, 0, 0, 1];
-        assert!(matches!(
-            decode_enumerated(&buf),
-            Err(BerError::LengthOutOfRange)
-        ));
-        let buf = [0x0a, 0x04, 0xff, 0xff, 0xff, 0xff];
-        assert_eq!(decode_enumerated(&buf).unwrap().0, u32::MAX);
+    fn enumerated_range_checks() {
+        // Above u32::MAX.
+        let buf = [0x0a, 0x05, 0x01, 0, 0, 0, 0];
+        assert!(matches!(decode_enumerated(&buf), Err(BerError::InvalidValue)));
+        // Negative.
+        let buf = [0x0a, 0x01, 0xff];
+        assert!(matches!(decode_enumerated(&buf), Err(BerError::InvalidValue)));
+        // Over-wide.
+        let buf = [0x0a, 0x09, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        assert!(matches!(decode_enumerated(&buf), Err(BerError::LengthOutOfRange)));
+        // u32::MAX needs a leading zero octet to stay positive.
+        let enc = encode_enumerated(u32::MAX);
+        assert_eq!(enc, &[0x0a, 0x05, 0x00, 0xff, 0xff, 0xff, 0xff]);
+        assert_eq!(decode_enumerated(&enc).unwrap().0, u32::MAX);
+        assert!(decode_enumerated(&[0x0a, 0x00]).is_err());
     }
 
     #[test]
     fn enumerated_roundtrip() {
-        for n in [0u32, 1, 49, 80, 127, 128, 255, 256] {
+        for n in [0u32, 1, 49, 80, 127, 128, 255, 256, 1 << 24, 1 << 31, u32::MAX] {
             let enc = encode_enumerated(n);
             let (dec, rest) = decode_enumerated(&enc).unwrap();
             assert_eq!(dec, n);
@@ -409,6 +408,59 @@ mod tests {
         let (v, rest) = decode_boolean(&buf).unwrap();
         assert!(!v);
         assert!(rest.is_empty());
+    }
+
+
+    #[test]
+    fn boolean_empty_content_is_false() {
+        let (v, _) = decode_boolean(&[0x01, 0x00]).unwrap();
+        assert!(!v);
+    }
+
+    #[test]
+    fn expect_tag_mismatch_reports_both_tags() {
+        let err = expect_tag(&[0x04, 0x00], TAG_INTEGER).unwrap_err();
+        assert!(matches!(err, BerError::UnexpectedTag { expected: 0x02, got: 0x04 }));
+        assert_eq!(err.to_string(), "Unexpected tag: expected 0x02, got 0x04");
+    }
+
+    #[test]
+    fn long_form_tags_are_rejected() {
+        assert!(matches!(parse_tlv(&[0x1f, 0x00]), Err(BerError::LongFormTag)));
+        assert!(matches!(parse_tlv(&[0xbf, 0x00]), Err(BerError::LongFormTag)));
+    }
+
+    #[test]
+    fn decode_string_rejects_bad_utf8() {
+        assert!(matches!(decode_string(&[0x04, 0x01, 0xff]), Err(BerError::InvalidUtf8)));
+    }
+
+    #[test]
+    fn error_display_strings_are_distinct() {
+        let errs = [
+            BerError::UnexpectedEof,
+            BerError::LongFormTag,
+            BerError::UnexpectedTag { expected: 1, got: 2 },
+            BerError::InvalidUtf8,
+            BerError::LengthOutOfRange,
+            BerError::NestingTooDeep,
+            BerError::InvalidValue,
+        ];
+        let texts: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
+        for (i, a) in texts.iter().enumerate() {
+            assert!(!a.is_empty());
+            for b in &texts[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        // It is a std Error too.
+        let _: &dyn std::error::Error = &errs[0];
+    }
+
+    #[test]
+    fn encode_set_concatenates_items() {
+        let set = encode_set(&[encode_string("a"), encode_string("b")]);
+        assert_eq!(set, &[0x31, 0x06, 0x04, 0x01, b'a', 0x04, 0x01, b'b']);
     }
 
     // Remaining bytes

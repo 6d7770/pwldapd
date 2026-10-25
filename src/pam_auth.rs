@@ -31,11 +31,32 @@ pub fn is_valid_username(name: &str) -> bool {
         })
 }
 
+/// Credential checker used by the bind handler. The production
+/// implementation talks to PAM; tests substitute an in-memory one.
+pub trait Authenticator: Send + Sync {
+    fn authenticate(&self, username: &str, password: &str) -> bool;
+}
+
+/// Authenticates against the `pwldapd` PAM service.
+pub struct PamAuthenticator;
+
+impl Authenticator for PamAuthenticator {
+    fn authenticate(&self, username: &str, password: &str) -> bool {
+        authenticate(username, password)
+    }
+}
+
 pub fn authenticate(username: &str, password: &str) -> bool {
+    authenticate_with_service(PAM_SERVICE, username, password)
+}
+
+/// Authenticate via the named PAM service. Split out so tests can point at
+/// a service that does not exist and still exercise the PAM call path.
+pub fn authenticate_with_service(service: &str, username: &str, password: &str) -> bool {
     if password.is_empty() || !is_valid_username(username) {
         return false;
     }
-    match pam::Authenticator::with_password(PAM_SERVICE) {
+    match pam::Authenticator::with_password(service) {
         Ok(mut auth) => {
             auth.get_handler().set_credentials(username, password);
             match auth.authenticate() {
@@ -58,6 +79,9 @@ pub fn authenticate(username: &str, password: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // Host assumptions: a working libpam with an /etc/pam.d directory. The
+    // PAM test uses a service name that does not exist, so PAM applies the
+    // `other` policy, which denies without touching real credentials.
     use super::*;
 
     #[test]
@@ -83,5 +107,28 @@ mod tests {
         assert!(!authenticate("alice", ""));
         assert!(!authenticate("", "secret"));
         assert!(!authenticate("ali\nce", "secret"));
+    }
+
+    #[test]
+    fn pam_denies_via_unknown_service() {
+        if !std::path::Path::new("/etc/pam.d").is_dir() {
+            eprintln!("skipping: no /etc/pam.d on this host");
+            return;
+        }
+        // An account that cannot exist, so no real credential is ever
+        // checked and no failure is recorded against a real user. This
+        // still runs pam_start/pam_authenticate/pam_end for real.
+        assert!(!authenticate_with_service(
+            "pwldapd-test-missing-service",
+            "pwldapd-no-such-user",
+            "not-a-password",
+        ));
+        // The trait wrapper short-circuits on invalid input before PAM.
+        assert!(!PamAuthenticator.authenticate("bad name", "x"));
+    }
+
+    #[test]
+    fn check_pam_service_does_not_panic() {
+        check_pam_service();
     }
 }

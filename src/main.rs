@@ -27,25 +27,13 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    const DEFAULT_CONFIG: &str = "/etc/pwldapd.toml";
-
-    let file_config = if let Some(path) = args.config.as_deref() {
-        Some(config::load_file_config(path)?)
-    } else if std::path::Path::new(DEFAULT_CONFIG).exists() {
-        Some(config::load_file_config(std::path::Path::new(DEFAULT_CONFIG))?)
-    } else {
-        None
-    };
-
-    let log_filter = file_config
-        .as_ref()
-        .and_then(|fc| fc.log_level.as_deref())
-        .map(tracing_subscriber::EnvFilter::new)
-        .or_else(|| tracing_subscriber::EnvFilter::try_from_default_env().ok())
-        .unwrap_or_else(|| "pwldapd=info".into());
+    let file_config = config::load_config(
+        args.config.as_deref(),
+        std::path::Path::new(config::DEFAULT_CONFIG_PATH),
+    )?;
 
     tracing_subscriber::fmt()
-        .with_env_filter(log_filter)
+        .with_env_filter(config::log_filter(file_config.as_ref()))
         .init();
 
     let cfg = config::merge_config(file_config, config::derive_base_dn)?;

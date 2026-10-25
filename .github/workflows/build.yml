@@ -26,3 +26,25 @@ jobs:
 
     - name: Run tests
       run: cargo test --verbose
+
+  coverage:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
+
+    - name: Install cargo-llvm-cov
+      uses: taiki-e/install-action@cargo-llvm-cov
+
+    - name: Measure coverage
+      run: cargo llvm-cov --lcov --output-path lcov.info --fail-under-lines 90
+
+    - name: Upload coverage report
+      uses: actions/upload-artifact@v4
+      with:
+        name: lcov.info
+        path: lcov.info

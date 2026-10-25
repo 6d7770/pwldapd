@@ -5,7 +5,7 @@ use crate::ldap::{
     SearchResultEntry,
 };
 use crate::passwd::{Directory, Group, User};
-use crate::pam_auth;
+use crate::pam_auth::{self, Authenticator};
 use anyhow::Result;
 use std::cell::OnceCell;
 use std::collections::HashSet;
@@ -17,10 +17,17 @@ use zeroize::Zeroizing;
 /// Account data source shared by all connections.
 pub type SharedDirectory = Arc<dyn Directory + Send + Sync>;
 
+/// The two system-facing dependencies of the protocol handler, so that
+/// tests can run the full request path against in-memory fakes.
+pub struct Backend {
+    pub dir: SharedDirectory,
+    pub auth: Arc<dyn Authenticator>,
+}
+
 pub async fn handle_connection<S>(
     mut stream: S,
     config: Arc<Config>,
-    dir: SharedDirectory,
+    backend: Arc<Backend>,
     peer: &str,
 ) -> Result<()>
 where
@@ -85,7 +92,7 @@ where
             }
             LdapOperation::BindRequest(req) => {
                 let (result, username) =
-                    do_bind(&req, &config, &dir, peer).await;
+                    do_bind(&req, &config, &backend, peer).await;
                 bound_as = username;
                 send(&mut stream, msg.message_id, &Response::Bind(result))
                     .await?;
@@ -96,7 +103,8 @@ where
                     None    => config.require_bind.is_empty(),
                 };
                 do_search(
-                    &req, msg.message_id, &config, &dir, &mut stream, authorized,
+                    &req, msg.message_id, &config, &backend.dir, &mut stream,
+                    authorized,
                 )
                 .await?;
             }
@@ -146,7 +154,7 @@ fn bind_username(name: &str, config: &Config) -> Option<String> {
 async fn do_bind(
     req: &ldap::BindRequest,
     config: &Arc<Config>,
-    dir: &SharedDirectory,
+    backend: &Arc<Backend>,
     peer: &str,
 ) -> (LdapResult, Option<String>) {
     let invalid = || LdapResult::error(ldap::INVALID_CREDENTIALS, "Invalid credentials");
@@ -177,15 +185,15 @@ async fn do_bind(
     };
     let password = password.clone();
     let config = Arc::clone(config);
-    let dir = Arc::clone(dir);
+    let backend = Arc::clone(backend);
     let username_clone = username.clone();
     let ok = tokio::task::spawn_blocking(move || {
-        if !pam_auth::authenticate(&username_clone, &password) {
+        if !backend.auth.authenticate(&username_clone, &password) {
             return false;
         }
         // Deny bind if the user's UID falls outside the configured range.
         // This keeps authentication consistent with what the directory serves.
-        match dir.user_by_name(&username_clone) {
+        match backend.dir.user_by_name(&username_clone) {
             Some(u) => config.uid_allowed(u.uid),
             // Authenticated via PAM but no passwd entry; permit the bind.
             None => true,
@@ -706,20 +714,18 @@ async fn read_ldap_message<S: AsyncRead + Unpin>(
     Ok(Zeroizing::new(header))
 }
 
+/// In-memory directory, authenticator and fixtures shared by the test
+/// modules of this crate.
 #[cfg(test)]
-#[allow(clippy::single_range_in_vec_init)]
-mod tests {
+pub mod testutil {
     use super::*;
-    use crate::ber;
-    use crate::ldap::{Filter, Scope, SearchRequest};
+    use crate::pam_auth::Authenticator;
     use std::collections::HashMap;
 
-    // Test fixtures
-
     /// In-memory directory for tests.
-    struct MemDb {
-        users: Vec<User>,
-        groups: Vec<Group>,
+    pub struct MemDb {
+        pub users: Vec<User>,
+        pub groups: Vec<Group>,
     }
 
     impl Directory for MemDb {
@@ -733,21 +739,21 @@ mod tests {
         }
     }
 
-    fn db() -> MemDb {
+    pub fn db() -> MemDb {
         MemDb { users: users(), groups: groups() }
     }
 
-    fn cfg() -> Config {
+    pub fn cfg() -> Config {
         Config::for_test()
     }
 
-    fn cfg_with(f: impl FnOnce(&mut Config)) -> Config {
+    pub fn cfg_with(f: impl FnOnce(&mut Config)) -> Config {
         let mut c = Config::for_test();
         f(&mut c);
         c
     }
 
-    fn user(name: &str, uid: u32, gid: u32, gecos: &str) -> User {
+    pub fn user(name: &str, uid: u32, gid: u32, gecos: &str) -> User {
         User {
             name: name.into(),
             uid,
@@ -758,14 +764,14 @@ mod tests {
         }
     }
 
-    fn users() -> Vec<User> {
+    pub fn users() -> Vec<User> {
         vec![
             user("alice", 1001, 1001, "Alice Smith,,,"),
             user("bob", 1002, 1002, "Bob Jones"),
         ]
     }
 
-    fn group(name: &str, gid: u32, members: &[&str]) -> Group {
+    pub fn group(name: &str, gid: u32, members: &[&str]) -> Group {
         Group {
             name: name.into(),
             gid,
@@ -773,13 +779,51 @@ mod tests {
         }
     }
 
-    fn groups() -> Vec<Group> {
+    pub fn groups() -> Vec<Group> {
         vec![
             group("staff", 200, &["alice", "bob"]),
             group("wheel", 201, &["alice"]),
             group("empty", 202, &[]),
         ]
     }
+
+    /// Password table keyed by username.
+    pub struct FakeAuth(HashMap<&'static str, &'static str>);
+
+    impl Authenticator for FakeAuth {
+        fn authenticate(&self, username: &str, password: &str) -> bool {
+            self.0.get(username) == Some(&password)
+        }
+    }
+
+    pub fn fake_auth() -> FakeAuth {
+        FakeAuth(HashMap::from([
+            ("alice", "alice-pw"),
+            ("bob", "bob-pw"),
+            // Known to PAM but absent from the directory.
+            ("ghost", "ghost-pw"),
+        ]))
+    }
+
+    /// Backend over the in-memory fixtures.
+    pub fn test_backend() -> Arc<Backend> {
+        Arc::new(Backend { dir: Arc::new(db()), auth: Arc::new(fake_auth()) })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::single_range_in_vec_init)]
+mod tests {
+    // Host assumptions: none. Everything here runs against in-memory
+    // fakes over a duplex pipe.
+    use super::testutil::*;
+    use super::*;
+    use crate::ber;
+    use crate::ldap::testutil::*;
+    use crate::ldap::{Filter, Scope, SearchRequest};
+    use proptest::prelude::*;
+    use std::collections::HashMap;
+    use std::time::Duration;
 
     fn present() -> Filter {
         Filter::Present("objectClass".into())
@@ -1331,43 +1375,26 @@ mod tests {
         }
     }
 
+    proptest! {
+        #[test]
+        fn read_message_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..32)) {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let _ = rt.block_on(read_from(&bytes));
+        }
+
+        #[test]
+        fn bind_username_never_panics_and_only_returns_valid_names(name in ".{0,40}") {
+            if let Some(u) = bind_username(&name, &cfg()) {
+                prop_assert!(pam_auth::is_valid_username(&u));
+            }
+        }
+    }
+
     // Connection-level behaviour, driven over an in-memory duplex pipe.
 
     async fn client_read<S: AsyncRead + Unpin>(s: &mut S) -> (i64, u8, Vec<u8>) {
         let bytes = read_ldap_message(s).await.expect("response");
-        let (seq, _) = ber::expect_tag(&bytes, ber::TAG_SEQUENCE).unwrap();
-        let (id, rest) = ber::decode_integer(seq).unwrap();
-        let (tag, value, _) = ber::parse_tlv(rest).unwrap();
-        (id, tag, value.to_vec())
-    }
-
-    fn result_code(op_value: &[u8]) -> u32 {
-        ber::decode_enumerated(op_value).unwrap().0
-    }
-
-    fn envelope(id: i64, op: Vec<u8>) -> Vec<u8> {
-        let mut content = ber::encode_integer(id);
-        content.extend(op);
-        ber::encode_tlv(ber::TAG_SEQUENCE, &content)
-    }
-
-    fn bind_msg(id: i64, name: &str, auth: Vec<u8>) -> Vec<u8> {
-        let mut body = ber::encode_integer(3);
-        body.extend(ber::encode_string(name));
-        body.extend(auth);
-        envelope(id, ber::encode_tlv(0x60, &body))
-    }
-
-    fn search_msg(id: i64, base: &str, scope: u32, size_limit: i64, types_only: bool) -> Vec<u8> {
-        let mut body = ber::encode_string(base);
-        body.extend(ber::encode_enumerated(scope));
-        body.extend(ber::encode_enumerated(0));
-        body.extend(ber::encode_integer(size_limit));
-        body.extend(ber::encode_integer(0));
-        body.extend(ber::encode_tlv(ber::TAG_BOOLEAN, &[if types_only { 0xff } else { 0 }]));
-        body.extend(ber::encode_tlv(0x87, b"objectClass"));
-        body.extend(ber::encode_tlv(ber::TAG_SEQUENCE, &[]));
-        envelope(id, ber::encode_tlv(0x63, &body))
+        decode_envelope(&bytes)
     }
 
     /// Start a handler on one end of a duplex pipe; return the client end
@@ -1375,9 +1402,9 @@ mod tests {
     fn connect(cfg: Config) -> (tokio::io::DuplexStream, tokio::task::JoinHandle<Result<()>>) {
         let (client, server) = tokio::io::duplex(64 * 1024);
         let cfg = Arc::new(cfg);
-        let dir: SharedDirectory = Arc::new(db());
+        let backend = test_backend();
         let task = tokio::spawn(async move {
-            handle_connection(server, cfg, dir, "test").await
+            handle_connection(server, cfg, backend, "test").await
         });
         (client, task)
     }
@@ -1389,33 +1416,82 @@ mod tests {
         loop {
             let (_, tag, value) = client_read(s).await;
             match tag {
-                0x64 => entries.push(value),
-                0x65 => return (entries, result_code(&value)),
+                SEARCH_RESULT_ENTRY => entries.push(value),
+                SEARCH_RESULT_DONE => return (entries, result_code(&value)),
                 t => panic!("unexpected tag {t:#x}"),
             }
         }
     }
 
+    /// Send a bind and return `(message_id, result_code)`.
+    async fn bind(c: &mut tokio::io::DuplexStream, id: i64, name: &str, pw: &str) -> (i64, u32) {
+        c.write_all(&bind_msg(id, name, pw)).await.unwrap();
+        let (mid, tag, value) = client_read(c).await;
+        assert_eq!(tag, BIND_RESPONSE);
+        (mid, result_code(&value))
+    }
+
+    /// One-level search of the people OU; returns `(entry count, code)`.
+    async fn people_search(c: &mut tokio::io::DuplexStream, id: i64) -> (usize, u32) {
+        c.write_all(&search_msg(id, "ou=people,dc=example,dc=com", 1, 0, false, f_present("objectClass")))
+            .await.unwrap();
+        let (entries, code) = read_search(c).await;
+        (entries.len(), code)
+    }
+
     #[tokio::test]
     async fn anonymous_bind_then_search_and_unbind() {
         let (mut c, task) = connect(cfg());
-        c.write_all(&bind_msg(1, "", ber::encode_tlv(0x80, b""))).await.unwrap();
-        let (id, tag, value) = client_read(&mut c).await;
-        assert_eq!((id, tag, result_code(&value)), (1, 0x61, ldap::SUCCESS));
-
-        c.write_all(&search_msg(2, "ou=people,dc=example,dc=com", 1, 0, false)).await.unwrap();
-        let (entries, code) = read_search(&mut c).await;
-        assert_eq!(entries.len(), 2);
-        assert_eq!(code, ldap::SUCCESS);
-
-        c.write_all(&envelope(3, ber::encode_tlv(0x42, &[]))).await.unwrap();
+        assert_eq!(bind(&mut c, 1, "", "").await, (1, ldap::SUCCESS));
+        assert_eq!(people_search(&mut c, 2).await, (2, ldap::SUCCESS));
+        c.write_all(&unbind_msg(3)).await.unwrap();
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_bind_success_and_failure() {
+        let (mut c, _task) = connect(cfg());
+        assert_eq!(bind(&mut c, 1, "uid=alice,ou=people,dc=example,dc=com", "alice-pw").await.1, ldap::SUCCESS);
+        assert_eq!(bind(&mut c, 2, "alice", "alice-pw").await.1, ldap::SUCCESS);
+        assert_eq!(bind(&mut c, 3, "alice", "wrong").await.1, ldap::INVALID_CREDENTIALS);
+        assert_eq!(bind(&mut c, 4, "alice", "").await.1, ldap::INVALID_CREDENTIALS);
+        assert_eq!(bind(&mut c, 5, "carol", "alice-pw").await.1, ldap::INVALID_CREDENTIALS);
+    }
+
+    #[tokio::test]
+    async fn require_bind_enforced_per_identity() {
+        let (mut c, _task) = connect(cfg_with(|c| c.require_bind = vec!["alice".into()]));
+        // Anonymous: blocked.
+        assert_eq!(people_search(&mut c, 1).await, (0, ldap::INSUFFICIENT_ACCESS_RIGHTS));
+        // Bob authenticates fine but is not on the list.
+        assert_eq!(bind(&mut c, 2, "bob", "bob-pw").await.1, ldap::SUCCESS);
+        assert_eq!(people_search(&mut c, 3).await, (0, ldap::INSUFFICIENT_ACCESS_RIGHTS));
+        // Alice is permitted.
+        assert_eq!(bind(&mut c, 4, "alice", "alice-pw").await.1, ldap::SUCCESS);
+        assert_eq!(people_search(&mut c, 5).await, (2, ldap::SUCCESS));
+        // A failed re-bind drops the identity.
+        assert_eq!(bind(&mut c, 6, "alice", "nope").await.1, ldap::INVALID_CREDENTIALS);
+        assert_eq!(people_search(&mut c, 7).await, (0, ldap::INSUFFICIENT_ACCESS_RIGHTS));
+        // So does an anonymous re-bind.
+        assert_eq!(bind(&mut c, 8, "alice", "alice-pw").await.1, ldap::SUCCESS);
+        assert_eq!(bind(&mut c, 9, "", "").await.1, ldap::SUCCESS);
+        assert_eq!(people_search(&mut c, 10).await, (0, ldap::INSUFFICIENT_ACCESS_RIGHTS));
+    }
+
+    #[tokio::test]
+    async fn authenticated_user_outside_uid_range_is_refused() {
+        // alice=1001 is outside; bob=1002 is inside.
+        let (mut c, _task) = connect(cfg_with(|c| c.uid_ranges = vec![1002..=1002]));
+        assert_eq!(bind(&mut c, 1, "alice", "alice-pw").await.1, ldap::INVALID_CREDENTIALS);
+        assert_eq!(bind(&mut c, 2, "bob", "bob-pw").await.1, ldap::SUCCESS);
+        // Authenticated but unknown to the directory: permitted.
+        assert_eq!(bind(&mut c, 3, "ghost", "ghost-pw").await.1, ldap::SUCCESS);
     }
 
     #[tokio::test]
     async fn size_limit_and_types_only_are_honoured() {
         let (mut c, _task) = connect(cfg());
-        c.write_all(&search_msg(1, "ou=people,dc=example,dc=com", 1, 1, true)).await.unwrap();
+        c.write_all(&search_msg(1, "ou=people,dc=example,dc=com", 1, 1, true, f_present("objectClass"))).await.unwrap();
         let (entries, code) = read_search(&mut c).await;
         assert_eq!(entries.len(), 1);
         assert_eq!(code, ldap::SIZE_LIMIT_EXCEEDED);
@@ -1435,10 +1511,37 @@ mod tests {
         assert!(seen > 0);
 
         // A limit equal to the result count is not "exceeded".
-        c.write_all(&search_msg(2, "ou=people,dc=example,dc=com", 1, 2, false)).await.unwrap();
+        c.write_all(&search_msg(2, "ou=people,dc=example,dc=com", 1, 2, false, f_present("objectClass"))).await.unwrap();
         let (entries, code) = read_search(&mut c).await;
-        assert_eq!(entries.len(), 2);
+        assert_eq!((entries.len(), code), (2, ldap::SUCCESS));
+    }
+
+    #[tokio::test]
+    async fn requested_attributes_are_selected_on_the_wire() {
+        let (mut c, _task) = connect(cfg());
+        c.write_all(&search_msg_attrs(1, "uid=alice,ou=people,dc=example,dc=com", 0, 0, false,
+            f_present("objectClass"), &["uid", "mail"])).await.unwrap();
+        let (entries, code) = read_search(&mut c).await;
+        assert_eq!((entries.len(), code), (1, ldap::SUCCESS));
+        let (dn, rest) = ber::decode_string(&entries[0]).unwrap();
+        assert_eq!(dn, "uid=alice,ou=people,dc=example,dc=com");
+        let (attr_list, _) = ber::expect_tag(rest, ber::TAG_SEQUENCE).unwrap();
+        let (a, rest) = ber::expect_tag(attr_list, ber::TAG_SEQUENCE).unwrap();
+        assert!(rest.is_empty(), "only uid should be present");
+        let (name, _) = ber::decode_string(a).unwrap();
+        assert_eq!(name, "uid");
+    }
+
+    #[tokio::test]
+    async fn filter_is_applied_on_the_wire() {
+        let (mut c, _task) = connect(cfg());
+        let f = f_and(&[f_eq("objectClass", "posixAccount"), f_ge("uidNumber", "1002")]);
+        c.write_all(&search_msg(1, "dc=example,dc=com", 2, 0, false, f)).await.unwrap();
+        let (entries, code) = read_search(&mut c).await;
         assert_eq!(code, ldap::SUCCESS);
+        assert_eq!(entries.len(), 1);
+        let (dn, _) = ber::decode_string(&entries[0]).unwrap();
+        assert_eq!(dn, "uid=bob,ou=people,dc=example,dc=com");
     }
 
     #[tokio::test]
@@ -1451,9 +1554,11 @@ mod tests {
         // ExtendedRequest (StartTLS) maps to ExtendedResponse.
         c.write_all(&envelope(5, ber::encode_tlv(0x77, b"\x80\x00"))).await.unwrap();
         let (id, tag, value) = client_read(&mut c).await;
-        assert_eq!((id, tag, result_code(&value)), (5, 0x78, ldap::UNWILLING_TO_PERFORM));
+        assert_eq!((id, tag, result_code(&value)), (5, EXTENDED_RESPONSE, ldap::UNWILLING_TO_PERFORM));
+        // Abandon is accepted silently.
+        c.write_all(&envelope(6, ber::encode_tlv(0x70, &[0x05]))).await.unwrap();
         // Still serving.
-        c.write_all(&search_msg(6, "", 0, 0, false)).await.unwrap();
+        c.write_all(&search_msg(7, "", 0, 0, false, f_present("objectClass"))).await.unwrap();
         let (entries, code) = read_search(&mut c).await;
         assert_eq!((entries.len(), code), (1, ldap::SUCCESS));
     }
@@ -1461,27 +1566,16 @@ mod tests {
     #[tokio::test]
     async fn sasl_bind_is_refused_with_auth_method_not_supported() {
         let (mut c, _task) = connect(cfg());
-        let sasl = ber::encode_tlv(0xa3, &ber::encode_string("EXTERNAL"));
-        c.write_all(&bind_msg(1, "", sasl)).await.unwrap();
+        c.write_all(&sasl_bind_msg(1, "EXTERNAL")).await.unwrap();
         let (_, tag, value) = client_read(&mut c).await;
-        assert_eq!((tag, result_code(&value)), (0x61, ldap::AUTH_METHOD_NOT_SUPPORTED));
+        assert_eq!((tag, result_code(&value)), (BIND_RESPONSE, ldap::AUTH_METHOD_NOT_SUPPORTED));
     }
 
     #[tokio::test]
     async fn bind_with_foreign_dn_is_invalid_credentials() {
         let (mut c, _task) = connect(cfg());
-        c.write_all(&bind_msg(1, "uid=alice,dc=evil", ber::encode_tlv(0x80, b"pw"))).await.unwrap();
-        let (_, tag, value) = client_read(&mut c).await;
-        assert_eq!((tag, result_code(&value)), (0x61, ldap::INVALID_CREDENTIALS));
-    }
-
-    #[tokio::test]
-    async fn require_bind_blocks_anonymous_search() {
-        let (mut c, _task) = connect(cfg_with(|c| c.require_bind = vec!["svc".into()]));
-        c.write_all(&search_msg(1, "", 0, 0, false)).await.unwrap();
-        let (entries, code) = read_search(&mut c).await;
-        assert!(entries.is_empty());
-        assert_eq!(code, ldap::INSUFFICIENT_ACCESS_RIGHTS);
+        // Correct password, wrong tree: must not reach the authenticator.
+        assert_eq!(bind(&mut c, 1, "uid=alice,dc=evil", "alice-pw").await.1, ldap::INVALID_CREDENTIALS);
     }
 
     #[tokio::test]
@@ -1490,21 +1584,39 @@ mod tests {
         // Well-framed SEQUENCE whose operation tag is unknown.
         c.write_all(&envelope(7, ber::encode_tlv(0x7e, b""))).await.unwrap();
         let (id, tag, value) = client_read(&mut c).await;
-        assert_eq!((id, tag, result_code(&value)), (0, 0x78, ldap::PROTOCOL_ERROR));
+        assert_eq!((id, tag, result_code(&value)), (0, EXTENDED_RESPONSE, ldap::PROTOCOL_ERROR));
         task.await.unwrap().unwrap();
         // Bad framing (indefinite length) also disconnects.
         let (mut c, task) = connect(cfg());
         c.write_all(&[0x30, 0x80]).await.unwrap();
         let (id, tag, _) = client_read(&mut c).await;
-        assert_eq!((id, tag), (0, 0x78));
+        assert_eq!((id, tag), (0, EXTENDED_RESPONSE));
         task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
+    async fn client_dropping_connection_ends_handler_cleanly() {
+        let (c, task) = connect(cfg());
+        drop(c);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn idle_connection_is_closed() {
-        let cfg = cfg_with(|c| c.idle_timeout = Some(std::time::Duration::from_millis(50)));
+        // With the clock paused tokio advances time as soon as every task
+        // is idle, so the 5 minute timeout elapses instantly and the test
+        // cannot flake on wall-clock scheduling.
+        let cfg = cfg_with(|c| c.idle_timeout = Some(Duration::from_secs(300)));
         let (_c, task) = connect(cfg);
-        let res = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
-        res.expect("handler returned before test timeout").unwrap().unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_disabled_keeps_connection_open() {
+        let cfg = cfg_with(|c| c.idle_timeout = None);
+        let (mut c, task) = connect(cfg);
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        assert!(!task.is_finished());
+        assert_eq!(bind(&mut c, 1, "", "").await.1, ldap::SUCCESS);
     }
 }
