@@ -39,8 +39,8 @@ jobs:
             image: rockylinux/rockylinux:10
 
     steps:
-      - uses: actions/checkout@v4
-
+      # git must be present before checkout, otherwise actions/checkout
+      # downloads a tarball and the man page date step has no history.
       - name: Install build dependencies (Debian)
         if: matrix.format == 'deb'
         run: |
@@ -52,11 +52,15 @@ jobs:
         if: matrix.format == 'rpm'
         run: dnf install -y gcc pam-devel curl ca-certificates git
 
+      - uses: actions/checkout@v4
+
       - name: Install Rust
+        # The Rocky image declares no PATH, so GITHUB_PATH would leave
+        # later steps with only the added entry. Export the full PATH.
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "PATH=$HOME/.cargo/bin:$PATH" >> "$GITHUB_ENV"
 
       - name: Install cargo-binstall
         run: |
@@ -143,6 +147,16 @@ jobs:
             image: rockylinux/rockylinux:10
 
     steps:
+      - name: Install test dependencies (Debian)
+        if: matrix.format == 'deb'
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git python3
+
+      - name: Install test dependencies (Rocky)
+        if: matrix.format == 'rpm'
+        run: dnf install -y git python3
+
       - uses: actions/checkout@v4
         with:
           sparse-checkout: pkg/ci
@@ -154,15 +168,13 @@ jobs:
 
       - name: Install package (Debian)
         if: matrix.format == 'deb'
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends python3 ./dist/*.deb
+        run: apt-get install -y --no-install-recommends ./dist/*.deb
 
       - name: Install package (Rocky)
         if: matrix.format == 'rpm'
         # Container images set tsflags=nodocs; clear it so the man page,
         # which is marked %doc, is installed and can be checked below.
-        run: dnf --setopt=tsflags= install -y python3 ./dist/*.rpm
+        run: dnf --setopt=tsflags= install -y ./dist/*.rpm
 
       - name: Verify installed files
         run: |
